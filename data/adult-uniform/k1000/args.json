@@ -1,0 +1,9 @@
+{
+    "dataset_name": null,
+    "dataset_path": "./data/adult/k1000/train.csv",
+    "n_synth_samples": 30932,
+    "n_synth_set": 1,
+    "output_dir": "./data/adult-uniform/k1000",
+    "output_name": "train",
+    "seed": 1000
+}

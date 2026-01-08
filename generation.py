@@ -219,11 +219,11 @@ def generate(
                     time_so_far = time.time() - start_time
                     print(time_so_far, max_allowed_time)
                     if time_so_far >= max_allowed_time:
-                        raise Exception("Breaking the generation loop!")
+                        raise Exception("Breaking the generation loop!00")
 
                 else:
                     if _cnt > max_retries and already_generated == 0:
-                        raise Exception("Breaking the generation loop!")
+                        raise Exception("Breaking the generation loop!11")
 
                 if drop_nan or do_impute:
                     pbar.update(len(processed_table))
@@ -333,7 +333,7 @@ def impute(
         time_so_far = time.time() - start_time
         print(time_so_far, max_allowed_time)
         if time_so_far >= max_allowed_time:
-            raise Exception("Breaking the generation loop!")
+            raise Exception("Breaking the generation loop!22")
 
     column_names = dataset.column_names
     if set(df_miss.columns) != set(column_names):

@@ -134,54 +134,54 @@ def download_adult(args):
     if not args.data_dir.exists():
         os.makedirs(args.data_dir)
 
-    baseurl = "https://archive.ics.uci.edu/ml/machine-learning-databases/adult/"
+    # baseurl = "https://archive.ics.uci.edu/ml/machine-learning-databases/adult/"
     filenames = ["adult.data", "adult.test", "adult.names"]
     filedir = args.data_dir
 
-    status = get_download_status(args.dataset_name, filedir)
+    # status = get_download_status(args.dataset_name, filedir)
+    # status = get_download_status(args.dataset_name, filedir)
+    # if all(status) and not args.force:
+    #     train = pd.read_csv(args.data_dir / "train.csv")
+    #     test = pd.read_csv(args.data_dir / "test.csv")
 
-    if all(status) and not args.force:
-        train = pd.read_csv(args.data_dir / "train.csv")
-        test = pd.read_csv(args.data_dir / "test.csv")
+    #     print("Dataset exists. Turn on `--force` to download it again.")
+    # else:
+    #     # download data
+    #     download(baseurl=baseurl, filenames=filenames, filedir=filedir)
 
-        print("Dataset exists. Turn on `--force` to download it again.")
-    else:
-        # download data
-        download(baseurl=baseurl, filenames=filenames, filedir=filedir)
+    with open(f"{filedir}/adult.names", "r") as f:
+        names = f.read().strip().split("\n")
 
-        with open(f"{filedir}/adult.names", "r") as f:
-            names = f.read().strip().split("\n")
+    col_names = names[96:]
+    columns = [i.split(":")[0].lower() for i in col_names] + ["income"]
 
-        col_names = names[96:]
-        columns = [i.split(":")[0].lower() for i in col_names] + ["income"]
+    # load downloaded data
+    train = pd.read_csv(f"{filedir}/adult.data", names=columns)
+    test = pd.read_csv(f"{filedir}/adult.test", names=columns, skiprows=1)
 
-        # load downloaded data
-        train = pd.read_csv(f"{filedir}/adult.data", names=columns)
-        test = pd.read_csv(f"{filedir}/adult.test", names=columns, skiprows=1)
+    cat_cols = [
+        i.split(":")[0]
+        for i in col_names
+        if i.split(":")[1].strip() != "continuous."
+    ] + ["income"]
 
-        cat_cols = [
-            i.split(":")[0]
-            for i in col_names
-            if i.split(":")[1].strip() != "continuous."
-        ] + ["income"]
+    # preprocess data.
+    for col in train.columns:
+        if col in cat_cols:
+            train[col] = train[col].apply(lambda x: x.strip().capitalize())
 
-        # preprocess data.
-        for col in train.columns:
-            if col in cat_cols:
-                train[col] = train[col].apply(lambda x: x.strip().capitalize())
+    for col in test.columns:
+        if col in cat_cols:
+            test[col] = test[col].apply(lambda x: x.strip().capitalize())
 
-        for col in test.columns:
-            if col in cat_cols:
-                test[col] = test[col].apply(lambda x: x.strip().capitalize())
+    test["income"] = test["income"].apply(lambda x: x.strip("."))
+    train["income"] = train["income"].apply(lambda x: x.strip("."))
 
-        test["income"] = test["income"].apply(lambda x: x.strip("."))
-        train["income"] = train["income"].apply(lambda x: x.strip("."))
+    # save data as CSV files.
+    save_files(args, filedir, train, test)
 
-        # save data as CSV files.
-        save_files(args, filedir, train, test)
-
-        # remove the downloaded files
-        delete(filenames=filenames, filedir=filedir)
+    # remove the downloaded files
+    delete(filenames=filenames, filedir=filedir)
 
     # train = train.replace("?", "NA")
     # test = test.replace("?", "NA")

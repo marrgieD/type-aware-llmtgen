@@ -1,4 +1,4 @@
-ROOT_FOLDER=~/Documents/Projects/
+ROOT_FOLDER=~
 PROJECT_FOLDER=$ROOT_FOLDER/DP-2Stage
 
 CONFIG=$1
@@ -15,7 +15,7 @@ export HF_HOME=${PROJECT_FOLDER}
 SYNTH_FOLDER=${SYNTH_FOLDER}_impute-${DO_IMPUTE}
 echo $SYNTH_FOLDER
 # CUDA_LAUNCH_BLOCKING=1 
-python $PROJECT_FOLDER/ft_opacus.py \
+python3 $PROJECT_FOLDER/ft_opacus.py \
 --train_file ${TRAIN_FILE} \
 --model_name_or_path ${MODEL_NAME_OR_PATH} \
 --model_type ${MODEL_TYPE} \

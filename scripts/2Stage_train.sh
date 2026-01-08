@@ -1,4 +1,4 @@
-ROOT_FOLDER=~/Documents/Projects/
+ROOT_FOLDER=~
 PROJECT_FOLDER=$ROOT_FOLDER/DP-2Stage
 cd $PROJECT_FOLDER 
 
@@ -14,7 +14,7 @@ CONFIG=$1
 echo "CONFIG....."
 echo ${CONFIG}
 source ${CONFIG}
-
+MODEL_NAME_OR_PATH="/data/users/magg13_d_/DP-2Stage/runs/2Stage_LR0.0005-k1000-linear/stage1_shuffle-False-adult_wl-1/adult-uniform/NonDP/GPT2/entire/ts30932-bs32-epoch5/epoch5"
 if [[ ${MODEL_NAME_OR_PATH_2STAGE} ]]
 then 
     MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH_2STAGE}
@@ -36,7 +36,7 @@ if [[ ${STAGE} == '2' ]]
         OUTPUT_DIR=${BASEFOLDER}/${DATASET_NAME}/${SETTING}/${FINETUNE_ADAPTER}/ts${MAX_FINETUNE_TRAIN_SIZE}-bs${TRAIN_BATCH_SIZE}-epoch${FINETUNE_EPOCH}-mbs${MICRO_BATCH_SIZE}-eps${EPSILON}-clip${CLIP}
     fi
 
-    python ${PROJECT_FOLDER}/ft_opacus.py \
+    python3 ${PROJECT_FOLDER}/ft_opacus.py \
     --train_file ${TRAIN_FILE} \
     --validation_file ${VALIDATION_FILE}\
     --model_name_or_path ${MODEL_NAME_OR_PATH} \
@@ -83,7 +83,7 @@ else
     fi
 
     echo $OUTPUT_DIR
-    python ${PROJECT_FOLDER}/ft_opacus.py \
+    python3 ${PROJECT_FOLDER}/ft_opacus.py \
     --train_file ${TRAIN_FILE} \
     --validation_file ${VALIDATION_FILE}\
     --model_name_or_path ${MODEL_NAME_OR_PATH} \

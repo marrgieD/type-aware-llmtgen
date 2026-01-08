@@ -1,4 +1,4 @@
-ROOT_FOLDER=~/Documents/Projects/
+ROOT_FOLDER=~
 PROJECT_FOLDER=$ROOT_FOLDER/DP-2Stage
 
 BINS="50 20"
@@ -27,7 +27,7 @@ do
     TEST_PATH=${PROJECT_FOLDER}/data/${DATASET_NAME}/k1000/test.csv
 
     echo $fake_path
-    python ${PROJECT_FOLDER}/metrics/run.py \
+    python3 ${PROJECT_FOLDER}/metrics/run.py \
         --fake_path ${fake_path} \
         --metric_name exact_duplicates \
         --train_path $TRAIN_PATH\
@@ -37,7 +37,7 @@ do
     for bins in ${BINS}
     do
         echo $fake_path, ${bins}
-        python ${PROJECT_FOLDER}/metrics/run.py \
+        python3 ${PROJECT_FOLDER}/metrics/run.py \
             --fake_path ${fake_path} \
             --metric_name histogram_intersection \
             --bins ${bins} \
@@ -51,7 +51,7 @@ do
         for model in ${MODELS}
         do
             echo $fake_path, ${scorer}, ${model}
-            python ${PROJECT_FOLDER}/metrics/run.py \
+            python3 ${PROJECT_FOLDER}/metrics/run.py \
                 --fake_path ${fake_path} \
                 --metric_name efficacy_test \
                 --model_name $model \

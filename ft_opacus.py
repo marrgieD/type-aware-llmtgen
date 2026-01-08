@@ -36,7 +36,7 @@ from peft import (
     AdaLoraConfig,
     VeraConfig,
 )
-
+import re
 from utils.misc import mkdir, str2bool
 from utils.models import AugmentedBlock
 from utils.dataset import LLMtgDataset
@@ -111,7 +111,7 @@ def parse_args():
         "constant_with_warmup"
     ])
     parser.add_argument("--num_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler.")
-    
+
     # DP hyperparams
     parser.add_argument("--enable_privacy", type=str2bool, default=False, help="Turn on privacy mode.")
     parser.add_argument("--micro_batch_size", type=int, default=1, help="Batch size for BatchMemoryManager dataloader")
@@ -167,6 +167,13 @@ def timeit(func):
 @timeit
 def main():
     args = parse_args()
+    # 【暴力关停 DP 模式】
+    args.enable_privacy = False  # <--- 加这一行，世界清静了
+    
+    # 可选：如果你想更保险一点，把噪音也清零
+    args.noise_multiplier = 0.0 
+    
+    print(f"【DEBUG】强制无 DP 模式: enable_privacy={args.enable_privacy}")
     set_seed(args.seed)
 
     mkdir(args.output_dir)
@@ -417,20 +424,8 @@ def main():
 
         # Resume Checkpoint?
 
-        if args.resume_checkpoint_path is not None:
-            (
-                model,
-                optimizer,
-                lr_scheduler,
-                starting_epochs,
-                completed_steps,
-            ) = resume_from_checkpoint_files(
-                model=model,
-                optimizer=optimizer,
-                lr_scheduler=lr_scheduler,
-                checkpoint_path=args.resume_checkpoint_path,
-            )
 
+        privacy_engine = None
         if args.enable_privacy:
             privacy_engine = PrivacyEngine(accountant="rdp")
             if args.noise_multiplier is not None:
@@ -481,7 +476,19 @@ def main():
 
             # epsilon, best_alpha = privacy_engine.get_epsilon(args.target_delta)
             # epsilon = privacy_engine.get_epsilon(DELTA)
-
+        if args.resume_checkpoint_path is not None:
+            (
+                model,
+                optimizer,
+                lr_scheduler,
+                starting_epochs,
+                completed_steps,
+            ) = resume_from_checkpoint_files(
+                model=model,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                checkpoint_path=args.resume_checkpoint_path,
+            )
         progress_bar.update(completed_steps)
 
         if args.resume_checkpoint_path is not None:
@@ -530,10 +537,10 @@ def main():
             )
 
         # _data_cnt = 0
-        if starting_epochs == args.num_train_epochs + 1:
-            raise Exception("All done Champ!")
+        # if starting_epochs == args.num_train_epochs + 1:
+            # raise Exception("All done Champ!")
 
-        for epoch in range(starting_epochs, args.num_train_epochs + 1):
+        for epoch in range(starting_epochs, args.num_train_epochs + 10):
             logger.info("***********")
             logger.info(f"{epoch}, {completed_steps}")
             # _batch_cnt = 0
@@ -586,29 +593,53 @@ def main():
                                     args.target_delta
                                 )
 
-                                if (
-                                    args.save_every_step is not None
-                                    and completed_steps % args.save_every_step == 0
-                                ):
-                                    # tmp
+                                # if (
+                                #     args.save_every_step is not None
+                                #     and completed_steps % args.save_every_step == 0
+                                # ):
+                                #     # tmp
+                                #     args.current_epoch = epoch
+                                #     args.current_step = completed_steps
+                                #     args.lr_scheduler = lr_scheduler
+                                #     args.optimizer = optimizer
+                                #     if epoch > 1:
+                                #         continue
+                                #     elif completed_steps in [25, 50, 75, 100]:
+                                #         savedir = (
+                                #             args.output_dir + f"/step{completed_steps}"
+                                #         )
+                                #         model_to_save = model._module
+                                #         save_model(model_to_save, savedir, args)
+                                #     else:
+                                #         savedir = (
+                                #             args.output_dir + f"/step{completed_steps}"
+                                #         )
+                                #         model_to_save = model._module
+                                #         save_model(model_to_save, savedir, args)
+                                if args.save_every_step is not None and completed_steps % args.save_every_step == 0:
                                     args.current_epoch = epoch
                                     args.current_step = completed_steps
                                     args.lr_scheduler = lr_scheduler
                                     args.optimizer = optimizer
-                                    if epoch > 1:
-                                        continue
-                                    elif completed_steps in [25, 50, 75, 100]:
-                                        savedir = (
-                                            args.output_dir + f"/step{completed_steps}"
-                                        )
-                                        model_to_save = model._module
-                                        save_model(model_to_save, savedir, args)
-                                    else:
-                                        savedir = (
-                                            args.output_dir + f"/step{completed_steps}"
-                                        )
-                                        model_to_save = model._module
-                                        save_model(model_to_save, savedir, args)
+
+                                    # 保存到固定目录 latest/
+                                    savedir = os.path.join(args.output_dir, "latest")
+                                    os.makedirs(savedir, exist_ok=True)
+
+                                    # DP 模型需要 unwrap
+                                    model_to_save = model._module if args.enable_privacy else model
+
+                                    save_model(model_to_save, savedir, args)
+
+                                    # 同时存 resume_checkpoint_dict.pt
+                                    torch.save({
+                                        "model_state_dict": model_to_save.state_dict(),
+                                        "optimizer_state_dict": optimizer.state_dict(),
+                                        "lr_scheduler_state_dict": lr_scheduler.state_dict(),
+                                        "epoch": epoch,
+                                        "step": completed_steps,
+                                    }, os.path.join(savedir, "resume_checkpoint_dict.pt"))
+
 
                                 step_or_epoch_logging_and_plotting(
                                     args,
@@ -665,25 +696,49 @@ def main():
                             args.target_delta
                         )
 
-                        if (
-                            args.save_every_step is not None
-                            and completed_steps % args.save_every_step == 0
-                        ):
-                            # tmp
+                        # if (
+                        #     args.save_every_step is not None
+                        #     and completed_steps % args.save_every_step == 0
+                        # ):
+                        #     # tmp
+                        #     args.current_epoch = epoch
+                        #     args.current_step = completed_steps
+                        #     args.lr_scheduler = lr_scheduler
+                        #     args.optimizer = optimizer
+                        #     if epoch > 1:
+                        #         continue
+                        #     elif completed_steps in [25, 50, 75, 100]:
+                        #         savedir = args.output_dir + f"/step{completed_steps}"
+                        #         model_to_save = model._module
+                        #         save_model(model_to_save, savedir, args)
+                        #     else:
+                        #         savedir = args.output_dir + f"/step{completed_steps}"
+                        #         model_to_save = model._module
+                        #         save_model(model_to_save, savedir, args)
+                        if args.save_every_step is not None and completed_steps % args.save_every_step == 0:
                             args.current_epoch = epoch
                             args.current_step = completed_steps
                             args.lr_scheduler = lr_scheduler
                             args.optimizer = optimizer
-                            if epoch > 1:
-                                continue
-                            elif completed_steps in [25, 50, 75, 100]:
-                                savedir = args.output_dir + f"/step{completed_steps}"
-                                model_to_save = model._module
-                                save_model(model_to_save, savedir, args)
-                            else:
-                                savedir = args.output_dir + f"/step{completed_steps}"
-                                model_to_save = model._module
-                                save_model(model_to_save, savedir, args)
+
+                            # 保存到固定目录 latest/
+                            savedir = os.path.join(args.output_dir, "latest")
+                            os.makedirs(savedir, exist_ok=True)
+
+                            # DP 模型需要 unwrap
+                            model_to_save = model._module if args.enable_privacy else model
+
+                            save_model(model_to_save, savedir, args)
+
+                            # 同时存 resume_checkpoint_dict.pt
+                            torch.save({
+                                "model_state_dict": model_to_save.state_dict(),
+                                "optimizer_state_dict": optimizer.state_dict(),
+                                "lr_scheduler_state_dict": lr_scheduler.state_dict(),
+                                "epoch": epoch,
+                                "step": completed_steps,
+                            }, os.path.join(savedir, "resume_checkpoint_dict.pt"))
+
 
                         step_or_epoch_logging_and_plotting(
                             args,
@@ -735,25 +790,49 @@ def main():
 
                     completed_steps += 1
 
-                    if (
-                        args.save_every_step is not None
-                        and completed_steps % args.save_every_step == 0
-                    ):
-                        # tmp
+                    # if (
+                    #     args.save_every_step is not None
+                    #     and completed_steps % args.save_every_step == 0
+                    # ):
+                    #     # tmp
+                    #     args.current_epoch = epoch
+                    #     args.current_step = completed_steps
+                    #     args.lr_scheduler = lr_scheduler
+                    #     args.optimizer = optimizer
+                    #     if epoch > 1:
+                    #         continue
+                    #     elif completed_steps in [25, 50, 75, 100]:
+                    #         savedir = args.output_dir + f"/step{completed_steps}"
+                    #         model_to_save = model
+                    #         save_model(model_to_save, savedir, args)
+                    #     else:
+                    #         savedir = args.output_dir + f"/step{completed_steps}"
+                    #         model_to_save = model
+                    #         save_model(model_to_save, savedir, args)
+                    if args.save_every_step is not None and completed_steps % args.save_every_step == 0:
                         args.current_epoch = epoch
                         args.current_step = completed_steps
                         args.lr_scheduler = lr_scheduler
                         args.optimizer = optimizer
-                        if epoch > 1:
-                            continue
-                        elif completed_steps in [25, 50, 75, 100]:
-                            savedir = args.output_dir + f"/step{completed_steps}"
-                            model_to_save = model
-                            save_model(model_to_save, savedir, args)
-                        else:
-                            savedir = args.output_dir + f"/step{completed_steps}"
-                            model_to_save = model
-                            save_model(model_to_save, savedir, args)
+
+                        # 保存到固定目录 latest/
+                        savedir = os.path.join(args.output_dir, "latest")
+                        os.makedirs(savedir, exist_ok=True)
+
+                        # DP 模型需要 unwrap
+                        model_to_save = model._module if args.enable_privacy else model
+
+                        save_model(model_to_save, savedir, args)
+
+                        # 同时存 resume_checkpoint_dict.pt
+                        torch.save({
+                            "model_state_dict": model_to_save.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "lr_scheduler_state_dict": lr_scheduler.state_dict(),
+                            "epoch": epoch,
+                            "step": completed_steps,
+                        }, os.path.join(savedir, "resume_checkpoint_dict.pt"))
+
 
                     step_or_epoch_logging_and_plotting(
                         args,
@@ -912,6 +991,8 @@ def step_or_epoch_logging_and_plotting(
     epoch,
     logging_mode,
 ):
+    if logging_mode == "Step" :
+        return
     # during training, I want to test on very small validation set at every step
     if validation_dataloader is not None:
         key_perp, val_perp, other_perp, total_perp = compute_disentangled_loss(
@@ -1215,24 +1296,67 @@ def load_model_from_checkpoint(model, checkpoint_path, logger=None):
     return model
 
 
+# def resume_from_checkpoint_files(model, optimizer, lr_scheduler, checkpoint_path):
+#     checkpoint = torch.load(checkpoint_path)
+#     model.load_state_dict(checkpoint["model_state_dict"])
+#     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+#     lr_scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+#     #  Restore RNG states
+#     torch.set_rng_state(checkpoint["rng_states"]["torch_rng_state"])
+#     if (
+#         torch.cuda.is_available()
+#         and checkpoint["rng_states"]["cuda_rng_state"] is not None
+#     ):
+#         torch.cuda.set_rng_state_all(checkpoint["rng_states"]["cuda_rng_state"])
+#     np.random.set_state(checkpoint["rng_states"]["numpy_rng_state"])
+#     random.setstate(checkpoint["rng_states"]["python_rng_state"])
+
+#     epoch = checkpoint["epoch"]
+#     step = checkpoint["step"]
+#     return model, optimizer, lr_scheduler, epoch + 1, step
+
 def resume_from_checkpoint_files(model, optimizer, lr_scheduler, checkpoint_path):
-    checkpoint = torch.load(checkpoint_path)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    lr_scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    # weights_only=False 消除警告
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    
+    # 1. 修复模型加载 (支持 DP 和非 DP)
+    if hasattr(model, "_module"):
+        model._module.load_state_dict(checkpoint["model_state_dict"])
+    else:
+        model.load_state_dict(checkpoint["model_state_dict"])
 
-    #  Restore RNG states
-    torch.set_rng_state(checkpoint["rng_states"]["torch_rng_state"])
-    if (
-        torch.cuda.is_available()
-        and checkpoint["rng_states"]["cuda_rng_state"] is not None
-    ):
-        torch.cuda.set_rng_state_all(checkpoint["rng_states"]["cuda_rng_state"])
-    np.random.set_state(checkpoint["rng_states"]["numpy_rng_state"])
-    random.setstate(checkpoint["rng_states"]["python_rng_state"])
+    # 2. 修复优化器加载
+    if "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
-    epoch = checkpoint["epoch"]
-    step = checkpoint["step"]
+    # 3. 【关键修复】自动兼容两种名字 (KeyError 救星)
+    # 先找 lr_scheduler_state_dict，找不到再找 scheduler_state_dict
+    scheduler_state = checkpoint.get("lr_scheduler_state_dict", checkpoint.get("scheduler_state_dict"))
+    if scheduler_state is not None:
+        lr_scheduler.load_state_dict(scheduler_state)
+    else:
+        print("Warning: No scheduler state found, skipping.")
+
+    # 4. 【预判修复】防止 RNG 缺失报错 (你 loop 里没存这个，不加检查必崩)
+    if "rng_states" in checkpoint:
+        rng = checkpoint["rng_states"]
+        try:
+            torch.set_rng_state(rng["torch_rng_state"])
+            if torch.cuda.is_available() and rng["cuda_rng_state"] is not None:
+                torch.cuda.set_rng_state_all(rng["cuda_rng_state"])
+            np.random.set_state(rng["numpy_rng_state"])
+            random.setstate(rng["python_rng_state"])
+        except Exception as e:
+            print(f"Warning: Failed to restore RNG states: {e}")
+    else:
+        print("Warning: No RNG states found in checkpoint, skipping.")
+
+    # 5. 恢复 epoch 和 step
+    epoch = checkpoint.get("epoch", 0)
+    step = checkpoint.get("step", 0)
+    
+    # 防止因为从 loop 保存导致的 step 是当前的，加 1 继续跑
     return model, optimizer, lr_scheduler, epoch + 1, step
 
 
@@ -1588,41 +1712,80 @@ def compute_disentangled_loss_for_training(outputs, batch, dataset, alpha=1 / 3)
     return loss
 
 
-def find_latest_checkpoint(checkpoint_dir):
-    """
-    Find the latest checkpoint in the given directory by looking for files
-    that match the naming pattern of a checkpoint (e.g., epoch numbers).
-    """
-    checkpoint_files = []
+# def find_latest_checkpoint(checkpoint_dir):
+#     """
+#     Find the latest checkpoint in the given directory by looking for files
+#     that match the naming pattern of a checkpoint (e.g., epoch numbers).
+#     """
+#     checkpoint_files = []
 
-    # Walk through the directory and find all checkpoint files
-    for root, dirs, files in os.walk(checkpoint_dir):
-        for file in files:
-            if file.startswith("resume_checkpoint_dict"):
-                fullpath = os.path.join(root, file)
-                if "/epoch" in fullpath or "/step" in fullpath:
-                    checkpoint_files.append(os.path.join(root, file))
+#     # Walk through the directory and find all checkpoint files
+#     for root, dirs, files in os.walk(checkpoint_dir):
+#         for file in files:
+#             if file.startswith("resume_checkpoint_dict"):
+#                 fullpath = os.path.join(root, file)
+#                 if "/epoch" in fullpath or "/step" in fullpath:
+#                     checkpoint_files.append(os.path.join(root, file))
 
-    print(checkpoint_files)
-    if not checkpoint_files:
-        return None
+#     print(checkpoint_files)
+#     if not checkpoint_files:
+#         return None
 
-    # Sort the checkpoint files by epoch number (assuming the format contains epoch numbers)
-    # Extract epoch number from file names assuming format includes 'epoch<number>'
+#     # Sort the checkpoint files by epoch number (assuming the format contains epoch numbers)
+#     # Extract epoch number from file names assuming format includes 'epoch<number>'
 
-    try:
-        checkpoint_files.sort(key=lambda x: int(x.split("/epoch")[-1].split("/")[0]))
-    except:
-        try:
-            checkpoint_files.sort(key=lambda x: int(x.split("/step")[-1].split("/")[0]))
-        except:
-            return None
+#     try:
+#         checkpoint_files.sort(key=lambda x: int(x.split("/epoch")[-1].split("/")[0]))
+#     except:
+#         try:
+#             checkpoint_files.sort(key=lambda x: int(x.split("/step")[-1].split("/")[0]))
+#         except:
+#             return None
 
-    # The last one should be the latest checkpoint
-    latest_checkpoint = checkpoint_files[-1]
+#     # The last one should be the latest checkpoint
+#     latest_checkpoint = checkpoint_files[-1]
 
-    return latest_checkpoint
+#     return latest_checkpoint
 
+def find_latest_checkpoint(checkpoint_dir: str):
+    step_ckpts = []
+    epoch_ckpts = []
+
+    for root, _, files in os.walk(checkpoint_dir):
+        for fn in files:
+            if fn != "resume_checkpoint_dict.pt":
+                continue
+            full = os.path.join(root, fn)
+
+            # 识别 stepNNN 格式
+            m = re.search(r"/step(\d+)/resume_checkpoint_dict\.pt$", full)
+            if m:
+                step_ckpts.append((int(m.group(1)), full))
+                continue
+
+            # 识别 epochNNN 格式
+            m = re.search(r"/epoch(\d+)/resume_checkpoint_dict\.pt$", full)
+            if m:
+                epoch_ckpts.append((int(m.group(1)), full))
+                continue
+
+            # 识别 latest 目录
+            if "/latest/" in full:
+                # latest 一律给一个很大的优先级
+                step_ckpts.append((10**9, full))
+                continue
+
+    if step_ckpts:
+        return max(step_ckpts, key=lambda x: x[0])[1]
+    if epoch_ckpts:
+        return max(epoch_ckpts, key=lambda x: x[0])[1]
+
+    # 兜底
+    root_ckpt = os.path.join(checkpoint_dir, "resume_checkpoint_dict.pt")
+    if os.path.exists(root_ckpt):
+        return root_ckpt
+
+    return None
 
 def calc_grad_norm(model, return_counter=False):
     from collections import Counter
