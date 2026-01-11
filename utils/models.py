@@ -198,7 +198,7 @@ class TypeAwareGPT2(GPT2PreTrainedModel):
         lm_logits = self.lm_head(hidden_states)
 
         return {
-            "hidden_states": hidden_states,
+            # "hidden_states": hidden_states,
             "col_positions": col_positions,
             "valid_mask": valid_mask,   # ✅ Added this
             "lm_logits": lm_logits,

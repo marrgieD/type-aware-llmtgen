@@ -1156,7 +1156,10 @@ def get_metadata(data):
             # Mixed 判定
             zero_rate = (col_data == 0).mean()
             nan_rate = col_data.isna().mean()
-            is_mixed = (zero_rate + nan_rate) > MIXED_THRESHOLD
+            # is_mixed = (zero_rate + nan_rate) > MIXED_THRESHOLD
+            # 只有当 (存在缺失/0) 且 (存在有效数值) 时，才是 Mixed
+            has_values = (len(col) - col.isna().sum()) > 0
+            is_mixed = ((zero_rate + nan_rate) > 0.05) and has_values
             
             metadata[col_lower]["type"] = "mixed" if is_mixed else "numerical"
             

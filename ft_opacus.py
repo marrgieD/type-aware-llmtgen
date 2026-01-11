@@ -71,130 +71,178 @@ def calculate_data_stats(dataset):
     return cat_vocab_size
 
 
-def compute_loss(model_outputs, batch, expert_loss_weight=1.0, num_bins=100):
+def compute_loss(model_outputs, batch, expert_loss_weight=1.0, lm_loss_weight=0.5, num_bins=None):
     """
     Compute hybrid loss: LM Loss + expert_loss_weight * Expert Loss.
-    
-    Args:
-        model_outputs: Dictionary with 'lm_logits' and 'expert_outputs'
-        batch: Dictionary with 'labels' and expert labels
-        expert_loss_weight: Weight for expert loss (default 1.0)
-        num_bins: Number of bins for numeric prediction
-    
-    Returns:
-        loss: Total loss (scalar tensor)
-        lm_loss_item: LM loss value (float)
-        expert_loss_item: Expert loss value (float)
+    Hardened version: Uses reshape(), dynamic shape inference, and strict null checks.
     """
-    # 1. LM Loss
-    lm_logits = model_outputs['lm_logits']  # [B, T, vocab_size]
-    labels = batch['labels']  # [B, T]
+    # 1. LM Loss (Strict Check)
+    lm_logits = model_outputs.get("lm_logits", None)
+    if lm_logits is None:
+        raise ValueError("model_outputs missing 'lm_logits'. Check model return dict.")
+
+    labels = batch['labels']
     device = lm_logits.device
     
-    # Shift so that token < n predicts n
+    # Shift predictions
     shift_logits = lm_logits[..., :-1, :].contiguous()
     shift_labels = labels[..., 1:].contiguous()
     
-    lm_loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
+    # 动态获取 Vocab Size，不依赖配置
+    vocab_size = shift_logits.size(-1)
+
+    lm_loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+    # 🛡️ 改进：使用 reshape 替代 view，处理非 contiguous 情况
     lm_loss = lm_loss_fct(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1)
+        shift_logits.reshape(-1, vocab_size),
+        shift_labels.reshape(-1)
     )
     lm_loss_item = lm_loss.item()
     
-    # 2. Expert Loss
-    expert_outputs = model_outputs['expert_outputs']
-    col_positions = model_outputs.get('col_positions')  # [B, C]
-    
-    # Extract expert labels from batch
-    col_type_ids = batch.get('col_type_ids')  # [B, C] where 0=num, 1=cat, 2=mixed
-    num_bin_labels = batch.get('num_bin')  # [B, C]
-    num_res_labels = batch.get('num_res')  # [B, C]
-    cat_id_labels = batch.get('cat_id')  # [B, C]
-    mixed_mask_labels = batch.get('mixed_mask')  # [B, C]
-    mixed_bin_labels = batch.get('mixed_bin')  # [B, C]
-    mixed_res_labels = batch.get('mixed_res')  # [B, C]
-    
-    if col_type_ids is None:
-        # 没有列类型就无法路由（训练你的算法必须有）
-        raise ValueError("Batch missing 'col_type_ids' required for routed expert loss.")
+    # 2. Expert Loss (Dynamic Denominator)
+    expert_outputs = model_outputs.get('expert_outputs')
+    if expert_outputs is None:
+        return lm_loss * lm_loss_weight, lm_loss_item, 0.0
 
+    # 🛡️ 改进：更严格的 Valid Mask / Position 检查
     valid_cols = model_outputs.get("valid_mask")
     if valid_cols is None:
+        col_positions = model_outputs.get('col_positions')
+        if col_positions is None:
+            raise ValueError("model_outputs missing both 'valid_mask' and 'col_positions'.")
         valid_cols = (col_positions >= 0)
+
+    col_type_ids = batch.get('col_type_ids') # 0=Num, 1=Cat, 2=Mixed
+    if col_type_ids is None:
+        raise ValueError("Batch missing 'col_type_ids'.")
 
     valid_cols = valid_cols.bool()
     col_type_ids = col_type_ids.long()
 
-    expert_loss = torch.zeros((), device=device)
+    # 初始化累加器
+    total_expert_loss_sum = torch.zeros((), device=device)
+    total_denom = torch.zeros((), device=device)
 
-    # ---------- Numeric ----------
-    is_num = valid_cols & (col_type_ids == 0)
-    if is_num.any().item() and (num_bin_labels is not None) and (num_res_labels is not None):
-        num_bin_logits = expert_outputs["num_bin_logits"]   # [B,C,K]
-        num_residual = expert_outputs["num_residual"]       # [B,C]
+    # 预定义 Loss
+    ce_none = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
+    mse_none = nn.MSELoss(reduction="none")
+    bce_none = nn.BCEWithLogitsLoss(reduction="none")
 
-        w = is_num.view(-1).float()
-        denom = w.sum() + 1e-8
+    # -----------------------------------------------------------
+    # Numeric (Bin + Residual)
+    # -----------------------------------------------------------
+    if (batch.get("num_bin") is not None) and (batch.get("num_res") is not None):
+        is_num = valid_cols & (col_type_ids == 0)
+        
+        if is_num.any():
+            num_bin_logits = expert_outputs["num_bin_logits"]
+            num_residual = expert_outputs["num_residual"]
+            num_bin_labels = batch["num_bin"]
+            num_res_labels = batch["num_res"]
 
-        ce = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
-        bin_loss = ce(num_bin_logits.view(-1, num_bins), num_bin_labels.view(-1))
-        bin_loss = (bin_loss * w).sum() / denom
+            # 1. Bin Loss
+            mask_bin = is_num & (num_bin_labels != -100)
+            if mask_bin.any():
+                # 🛡️ 改进：动态获取 K，不依赖参数 num_bins
+                K = num_bin_logits.size(-1)
+                # 🛡️ 改进：reshape 替代 view
+                raw_bin = ce_none(num_bin_logits.reshape(-1, K), num_bin_labels.reshape(-1))
+                mask_bin_flat = mask_bin.reshape(-1).float()
+                
+                total_expert_loss_sum += (raw_bin * mask_bin_flat).sum()
+                total_denom += mask_bin_flat.sum()
 
-        mse = nn.MSELoss(reduction="none")
-        res_loss = mse(num_residual.view(-1), num_res_labels.view(-1).float())
-        res_loss = (res_loss * w).sum() / denom
+            # 2. Residual Loss
+            mask_res = is_num & (num_res_labels != -100)
+            if mask_res.any():
+                raw_res = mse_none(num_residual.reshape(-1), num_res_labels.reshape(-1).float())
+                mask_res_flat = mask_res.reshape(-1).float()
+                
+                total_expert_loss_sum += (raw_res * mask_res_flat).sum()
+                total_denom += mask_res_flat.sum()
 
-        expert_loss = expert_loss + bin_loss + res_loss
+    # -----------------------------------------------------------
+    # Categorical
+    # -----------------------------------------------------------
+    if batch.get("cat_id") is not None:
+        is_cat = valid_cols & (col_type_ids == 1)
+        
+        if is_cat.any():
+            cat_logits = expert_outputs["cat_logits"]
+            cat_id_labels = batch["cat_id"]
+            
+            mask_cat = is_cat & (cat_id_labels != -100)
+            if mask_cat.any():
+                # 🛡️ 改进：动态获取 V_cat
+                V_cat = cat_logits.size(-1)
+                raw_cat = ce_none(cat_logits.reshape(-1, V_cat), cat_id_labels.reshape(-1))
+                mask_cat_flat = mask_cat.reshape(-1).float()
+                
+                total_expert_loss_sum += (raw_cat * mask_cat_flat).sum()
+                total_denom += mask_cat_flat.sum()
 
-    # ---------- Categorical ----------
-    is_cat = valid_cols & (col_type_ids == 1)
-    if is_cat.any().item() and (cat_id_labels is not None):
-        cat_logits = expert_outputs["cat_logits"]  # [B,C,Vcat]
+    # -----------------------------------------------------------
+    # Mixed
+    # -----------------------------------------------------------
+    if (batch.get("mixed_mask") is not None) and \
+       (batch.get("mixed_bin") is not None) and \
+       (batch.get("mixed_res") is not None):
+       
+        is_mixed = valid_cols & (col_type_ids == 2)
+        
+        if is_mixed.any():
+            mixed_mask_logits = expert_outputs["mixed_mask_logits"]
+            mixed_bin_logits = expert_outputs["mixed_bin_logits"]
+            mixed_residual = expert_outputs["mixed_residual"]
+            
+            mixed_mask_labels = batch["mixed_mask"]
+            mixed_bin_labels = batch["mixed_bin"]
+            mixed_res_labels = batch["mixed_res"]
 
-        w = is_cat.view(-1).float()
-        denom = w.sum() + 1e-8
+            # 1. Mask Prediction
+            mask_m = is_mixed 
+            if mask_m.any():
+                raw_mask = bce_none(mixed_mask_logits.reshape(-1), mixed_mask_labels.reshape(-1).float())
+                mask_m_flat = mask_m.reshape(-1).float()
+                
+                total_expert_loss_sum += (raw_mask * mask_m_flat).sum()
+                total_denom += mask_m_flat.sum()
 
-        ce = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
-        cat_loss = ce(cat_logits.view(-1, cat_logits.size(-1)), cat_id_labels.view(-1))
-        cat_loss = (cat_loss * w).sum() / denom
+            # 2. Value Prediction
+            # 🛡️ 改进：显式防御，确保 mixed_mask_labels 是 0/1 且不是 -100
+            # 假设 dataset 里 1.0 是 active, 0.0 是 missing/NaN
+            active = is_mixed & (mixed_mask_labels > 0.5)
+            
+            # Mixed Bin
+            mask_active_bin = active & (mixed_bin_labels != -100)
+            if mask_active_bin.any():
+                K_mix = mixed_bin_logits.size(-1)
+                raw_mix_bin = ce_none(mixed_bin_logits.reshape(-1, K_mix), mixed_bin_labels.reshape(-1))
+                mask_ab_flat = mask_active_bin.reshape(-1).float()
+                
+                total_expert_loss_sum += (raw_mix_bin * mask_ab_flat).sum()
+                total_denom += mask_ab_flat.sum()
+            
+            # Mixed Residual
+            mask_active_res = active 
+            if mask_active_res.any():
+                raw_mix_res = mse_none(mixed_residual.reshape(-1), mixed_res_labels.reshape(-1).float())
+                mask_ar_flat = mask_active_res.reshape(-1).float()
+                
+                total_expert_loss_sum += (raw_mix_res * mask_ar_flat).sum()
+                total_denom += mask_ar_flat.sum()
 
-        expert_loss = expert_loss + cat_loss
+    # 3. Final Aggregation
+    if total_denom.item() == 0:
+        expert_loss = torch.zeros((), device=device)
+    else:
+        expert_loss = total_expert_loss_sum / (total_denom + 1e-8)
+    
+    # 🛡️ 改进：detach() 防止 graph 泄漏，虽然 item() 也会 sync，但 detach 语义更清晰
+    expert_loss_item = expert_loss.detach().item()
 
-    # ---------- Mixed ----------
-    is_mixed = valid_cols & (col_type_ids == 2)
-    if is_mixed.any().item() and (mixed_mask_labels is not None) and (mixed_bin_labels is not None) and (mixed_res_labels is not None):
-        mixed_mask_logits = expert_outputs["mixed_mask_logits"]  # [B,C] logits
-        mixed_bin_logits = expert_outputs["mixed_bin_logits"]    # [B,C,K]
-        mixed_residual = expert_outputs["mixed_residual"]        # [B,C]
-
-        w_m = is_mixed.view(-1).float()
-        denom_m = w_m.sum() + 1e-8
-
-        bce = nn.BCEWithLogitsLoss(reduction="none")
-        mask_loss = bce(mixed_mask_logits.view(-1), mixed_mask_labels.view(-1).float())
-        mask_loss = (mask_loss * w_m).sum() / denom_m
-        expert_loss = expert_loss + mask_loss
-
-        # bin/res 只在 mask==1 的位置算
-        active = is_mixed & (mixed_mask_labels > 0.5)
-        if active.any().item():
-            w_a = active.view(-1).float()
-            denom_a = w_a.sum() + 1e-8
-
-            ce = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
-            bin_loss = ce(mixed_bin_logits.view(-1, num_bins), mixed_bin_labels.view(-1))
-            bin_loss = (bin_loss * w_a).sum() / denom_a
-
-            mse = nn.MSELoss(reduction="none")
-            res_loss = mse(mixed_residual.view(-1), mixed_res_labels.view(-1).float())
-            res_loss = (res_loss * w_a).sum() / denom_a
-
-            expert_loss = expert_loss + bin_loss + res_loss
-
-    expert_loss_item = float(expert_loss.detach().item())
-
-    total_loss = lm_loss + expert_loss_weight * expert_loss
+    total_loss = (lm_loss_weight * lm_loss) + (expert_loss_weight * expert_loss)
+    
     return total_loss, lm_loss_item, expert_loss_item
 
 
@@ -273,6 +321,8 @@ def parse_args():
     # Expert loss arguments
     parser.add_argument("--expert_loss_weight", type=float, default=1.0,
                        help="Weight for expert loss in hybrid loss")
+    parser.add_argument("--lm_loss_weight", type=float, default=0.1, 
+                       help="Weight for LM loss (reduce to focus on experts)")
     parser.add_argument("--num_bins", type=int, default=100,
                        help="Number of bins for numeric prediction")
     
@@ -423,6 +473,8 @@ def main():
         task_type=TaskType.CAUSAL_LM,  # Use CAUSAL_LM for GPT2-based models
         bias="none",
         target_modules=["c_attn", "c_fc", "c_proj"],  # GPT2 modules
+        modules_to_save=["num_expert", "mixed_expert", "cat_expert", "lm_head"],
+        target_modules=["q_proj", "v_proj"]
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
@@ -445,7 +497,8 @@ def main():
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=make_collate_fn(tokenizer)
+        collate_fn=make_collate_fn(tokenizer),
+        drop_last=True,
     )
     
     # Calculate training steps
@@ -527,6 +580,7 @@ def main():
                 loss, lm_loss_item, expert_loss_item = compute_loss(
                     outputs, batch,
                     expert_loss_weight=args.expert_loss_weight,
+                    lm_loss_weight=args.lm_loss_weight,
                     num_bins=args.num_bins,
                 )
 
