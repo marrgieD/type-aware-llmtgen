@@ -168,6 +168,7 @@ class TypeAwareGPT2(GPT2PreTrainedModel):
         col_positions=None,
         expert_token_idxs=None, 
         col_type_ids=None,
+        output_expert_logits=True,
         **kwargs
     ):
         # 1. Backbone
@@ -196,18 +197,23 @@ class TypeAwareGPT2(GPT2PreTrainedModel):
 
         # 5. LM Head
         lm_logits = self.lm_head(hidden_states)
-
-        return {
-            # "hidden_states": hidden_states,
-            "col_positions": col_positions,
-            "valid_mask": valid_mask,   # ✅ Added this
+        if notoutput_expert_logits:
+            return {
             "lm_logits": lm_logits,
-            "expert_outputs": {
-                "cat_logits": cat_logits,
-                "num_bin_logits": num_bin_logits,
-                "num_residual": num_residual,
-                "mixed_mask_logits": mixed_mask_logits,
-                "mixed_bin_logits": mixed_bin_logits,
-                "mixed_residual": mixed_residual,
-            },
-        }
+            # "transformer_outputs": transformer_outputs # 可选
+            }
+        else:
+            return {
+                # "hidden_states": hidden_states,
+                "col_positions": col_positions,
+                "valid_mask": valid_mask,   # ✅ Added this
+                "lm_logits": lm_logits,
+                "expert_outputs": {
+                    "cat_logits": cat_logits,
+                    "num_bin_logits": num_bin_logits,
+                    "num_residual": num_residual,
+                    "mixed_mask_logits": mixed_mask_logits,
+                    "mixed_bin_logits": mixed_bin_logits,
+                    "mixed_residual": mixed_residual,
+                },
+            }

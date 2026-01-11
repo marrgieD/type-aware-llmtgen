@@ -575,6 +575,7 @@ def main():
                     attention_mask=batch.get("attention_mask"),
                     expert_token_idxs=batch["expert_token_idxs"],
                     col_type_ids=batch.get("col_type_ids"),
+                    output_expert_logits=True,
                 )
 
                 loss, lm_loss_item, expert_loss_item = compute_loss(
