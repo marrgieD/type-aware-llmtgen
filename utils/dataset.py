@@ -87,13 +87,13 @@ class LLMtgDataset(Dataset):
             {"additional_special_tokens": special_tokens_list}
         )
         self.type_token_ids = {
-        "num": self.tokenizer.convert_tokens_to_ids(self.others_token.get("NUM", "[NUM]")),
-        "cat": self.tokenizer.convert_tokens_to_ids(self.others_token.get("CAT", "[CAT]")),
-        "mix": self.tokenizer.convert_tokens_to_ids(self.others_token.get("MIX", "[MIX]")),
-        "eoc": self.tokenizer.convert_tokens_to_ids(self.others_token.get("EOC", "[EOC]")),
-        "bos": self.tokenizer.convert_tokens_to_ids(self.others_token.get("BOS", "[BOS]")),
-        "eos": self.tokenizer.convert_tokens_to_ids(self.others_token.get("EOS", "[EOS]")),
-        "unk": self.tokenizer.convert_tokens_to_ids(self.others_token.get("UNK", "[UNK]")),
+        "NUM": self.tokenizer.convert_tokens_to_ids(self.others_token.get("NUM", "[NUM]")),
+        "CAT": self.tokenizer.convert_tokens_to_ids(self.others_token.get("CAT", "[CAT]")),
+        "MIX": self.tokenizer.convert_tokens_to_ids(self.others_token.get("MIX", "[MIX]")),
+        "EOC": self.tokenizer.convert_tokens_to_ids(self.others_token.get("EOC", "[EOC]")),
+        "BOS": self.tokenizer.convert_tokens_to_ids(self.others_token.get("BOS", "[BOS]")),
+        "EOS": self.tokenizer.convert_tokens_to_ids(self.others_token.get("EOS", "[EOS]")),
+        "UNK": self.tokenizer.convert_tokens_to_ids(self.others_token.get("UNK", "[UNK]")),
         }
         for k, v in self.type_token_ids.items():
             if v is None or v < 0:
@@ -102,7 +102,7 @@ class LLMtgDataset(Dataset):
             print(f"Added {num_added} special tokens: {special_tokens_list}")
         # this was necessary because of llama2 which by default prepends space to input.
         # couldn't figure out a way to disable this feature
-        self.tokenizer.add_tokens(self.others_token["text_sep"])
+        # self.tokenizer.add_tokens(self.others_token["text_sep"])
 
         # don't forget to
         # model.resize_token_embeddings(len(tokenizer))
@@ -229,7 +229,7 @@ class LLMtgDataset(Dataset):
             input_ids = output["input_ids"]
 
             ids = self.type_token_ids
-            mask = (input_ids == ids["num"]) | (input_ids == ids["cat"]) | (input_ids == ids["mix"])
+            mask = (input_ids == ids["NUM"]) | (input_ids == ids["CAT"]) | (input_ids == ids["MIX"])
 
             idxs = torch.nonzero(mask, as_tuple=False).view(-1)  # positions in token sequence
 
