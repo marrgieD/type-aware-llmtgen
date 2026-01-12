@@ -392,32 +392,16 @@ def generate_column_batch(
     
     return values
 
-
 def generate_synthetic_data(
     model, tokenizer, dataset, metadata, num_samples, device, 
     temperature=1.0, batch_size=32, logger=None, serializer="great"
 ):
     """
     Generate synthetic data row by row, column by column.
-    
-    Args:
-        model: TypeAwareGPT2 model
-        tokenizer: Tokenizer
-        dataset: LLMtgDataset (for column names and serializer info)
-        metadata: Metadata dict
-        num_samples: Number of samples to generate
-        device: Device
-        temperature: Sampling temperature
-        batch_size: Batch size for generation
-        logger: Logger
-    
-    Returns:
-        pd.DataFrame: Generated synthetic data
     """
     column_names = dataset.column_names
     serializer = dataset.serializer
     
-    # [关键修改] 复刻 dataset.py 的分隔符逻辑
     if serializer == "list":
         key_val_sep = ":"
     elif serializer == "text":
@@ -442,12 +426,14 @@ def generate_synthetic_data(
     logger.info(f"Generating {num_samples} samples, {len(column_names)} columns")
     
     # Generate column by column
+    # tqdm 这里会保留，显示进度条
     for col_idx, col_name in enumerate(tqdm(column_names, desc="Generating columns")):
         col_lower = col_name.lower()
         col_meta = metadata.get(col_lower)
         
         if col_meta is None:
-            logger.warning(f"Metadata not found for column {col_name}, skipping")
+            # 这里的 warning 如果也烦可以注释掉，但通常这个只会出一次
+            # logger.warning(f"Metadata not found for column {col_name}, skipping")
             for _ in range(num_samples):
                 generated_data[col_name].append("")
             continue
@@ -472,28 +458,34 @@ def generate_synthetic_data(
                     device=device,
                     temperature=temperature,
                     logger=logger,
-                    key_val_sep=key_val_sep  # <--- 新增传参
+                    key_val_sep=key_val_sep 
                 )
                 expected_n = (batch_end - batch_start)
                 if not isinstance(batch_values, list):
                     batch_values = list(batch_values)
+                
+                # --- 修改开始：屏蔽了这里的 Warning 输出 ---
                 if len(batch_values) != expected_n:
-                    if logger is not None:
-                        logger.warning(
-                            f"Column {col_name} batch {batch_start}-{batch_end}: got {len(batch_values)} values, expected {expected_n}. Padding/truncating."
-                        )
+                    # 原来的代码在这里疯狂输出 warning，现已注释掉
+                    # if logger is not None:
+                    #     logger.warning(
+                    #         f"Column {col_name} batch {batch_start}-{batch_end}: got {len(batch_values)} values, expected {expected_n}. Padding/truncating."
+                    #     )
+                    
+                    # 只要保留下面的补齐/截断逻辑，代码就能正常运行
                     if len(batch_values) < expected_n:
                         batch_values = batch_values + [""] * (expected_n - len(batch_values))
                     else:
                         batch_values = batch_values[:expected_n]
+                # --- 修改结束 ---
+
                 all_values.extend(batch_values)
             except Exception as e:
+                # 真正的 Error 建议保留，防止程序挂了不知道原因
                 logger.error(f"Error generating column {col_name} batch {batch_start}-{batch_end}: {e}")
-                # Fallback: fill with empty strings
                 all_values.extend([""] * (batch_end - batch_start))
         
-        # Update prompts: append " [TYPE] col_name is value [EOC]"
-        # Get type token for this column
+        # Update prompts
         type_token_map = {
             "numerical": "[NUM]",
             "categorical": "[CAT]",
@@ -503,23 +495,24 @@ def generate_synthetic_data(
         type_token = type_token_map.get(col_type, "[NUM]")
         
         for i, val in enumerate(all_values):
-            # Append: " [TYPE] col_name is value [EOC]"
             prompts[i] += f" {type_token} {col_name} {key_val_sep} {val} {eoc_token}"
             generated_data[col_name].append(val)
     
     # Convert to DataFrame and normalize column lengths
-    # Normalize column lengths (robust against occasional decode/parse mismatch)
     lengths = {k: len(v) for k, v in generated_data.items()}
     target_n = num_samples
     bad = {k: n for k, n in lengths.items() if n != target_n}
+    
+    # 这里的 Warning 只有在生成完所有数据后出现一次，如果不想要也可以注释掉
     if bad and logger is not None:
-        logger.warning(f"Column length mismatch before DataFrame: {bad}; padding/truncating to {target_n}")
+         pass # logger.warning(f"Column length mismatch before DataFrame: {bad}; padding/truncating to {target_n}")
+         
     for k, v in generated_data.items():
         if len(v) < target_n:
             v.extend([""] * (target_n - len(v)))
         elif len(v) > target_n:
             del v[target_n:]
-    # Convert to DataFrame
+            
     df = pd.DataFrame(generated_data)
     return df
 
