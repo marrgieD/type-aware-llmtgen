@@ -44,8 +44,8 @@ def calculate_data_stats(dataset):
     # 🟢 Fix B: 移除 magic number 100，确保架构一致性
     if not hasattr(dataset, 'metadata') or dataset.metadata is None:
         # 如果没有 metadata，默认给一个最小安全值，或者抛出警告
-        # 这里的 51 是基于一般情况的 fallback
-        return 51 
+        # 这里的 43 是基于一般情况的 fallback
+        return 43 
     
     max_cat_id = 0
     for col_name, col_meta in dataset.metadata.items():
@@ -55,7 +55,7 @@ def calculate_data_stats(dataset):
             if vocab_size > 0:
                 max_cat_id = max(max_cat_id, vocab_size - 1)
     
-    cat_vocab_size = max_cat_id + 1 if max_cat_id > 0 else 51
+    cat_vocab_size = max_cat_id + 1 if max_cat_id > 0 else 43
     return cat_vocab_size
 
 def compute_lm_loss(model_outputs, batch):

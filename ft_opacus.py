@@ -26,7 +26,7 @@ from safetensors import safe_open
 from utils.models import TypeAwareGPT2
 from utils.dataset import LLMtgDataset, get_metadata
 from utils.misc import mkdir
-from utils.utils import str2bool
+# from utils.utils import str2bool
 from torch.nn.utils.rnn import pad_sequence
 
 def get_logger(filename=None):
@@ -67,7 +67,7 @@ def calculate_data_stats(dataset):
                 # max_cat_id would be vocab_size - 1 (0-indexed)
                 max_cat_id = max(max_cat_id, vocab_size - 1)
     
-    cat_vocab_size = max_cat_id + 1 if max_cat_id > 0 else 51  # default fallback
+    cat_vocab_size = max_cat_id + 1 if max_cat_id > 0 else 43  # default fallback
     return cat_vocab_size
 
 
@@ -241,7 +241,17 @@ def compute_loss(model_outputs, batch, expert_loss_weight=1.0, lm_loss_weight=0.
     # 🛡️ 改进：detach() 防止 graph 泄漏，虽然 item() 也会 sync，但 detach 语义更清晰
     expert_loss_item = expert_loss.detach().item()
 
-    total_loss = (lm_loss_weight * lm_loss) + (expert_loss_weight * expert_loss)
+    expert_outputs = model_outputs['expert_outputs']
+    dummy_loss = 0.0
+    
+    # 遍历所有 expert 的输出 logits，全都乘 0 加进去
+    # 这样无论 batch 里有没有 mixed/num/cat 数据，计算图永远是通的
+    for key in ["num_bin_logits", "num_residual", 
+                "cat_logits", 
+                "mixed_mask_logits", "mixed_bin_logits", "mixed_residual"]:
+        if key in expert_outputs:
+            dummy_loss += expert_outputs[key].sum() * 0.0
+    total_loss = (lm_loss_weight * lm_loss) + (expert_loss_weight * expert_loss)+ dummy_loss
     
     return total_loss, lm_loss_item, expert_loss_item
 
@@ -339,7 +349,7 @@ def parse_args():
                        help="Path to Stage 1 checkpoint (loads before LoRA/Opacus)")
     
     # Opacus/Privacy arguments
-    parser.add_argument("--enable_privacy", type=str2bool, default=False,
+    parser.add_argument("--enable_privacy", type=bool, default=False,
                        help="Enable differential privacy")
     parser.add_argument("--target_epsilon", type=float, default=1.0,
                        help="Target epsilon for privacy budget")
@@ -377,6 +387,20 @@ def load_stage1_checkpoint(model, checkpoint_path, logger):
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             ckpt = ckpt["model_state_dict"]
     
+    # Handle potential vocab-size mismatch for categorical head
+    def _drop_if_shape_mismatch(key):
+        if key in ckpt:
+            saved_shape = ckpt[key].shape
+            target_shape = model.state_dict()[key].shape
+            if saved_shape != target_shape:
+                logger.warning(
+                    f"Drop mismatched key '{key}': ckpt {saved_shape} vs model {target_shape}"
+                )
+                ckpt.pop(key)
+
+    _drop_if_shape_mismatch("cat_expert.cat_head.weight")
+    _drop_if_shape_mismatch("cat_expert.cat_head.bias")
+
     # At this point, model is still the base TypeAwareGPT2 (no LoRA applied yet)
     # Load with strict=False to handle potential key mismatches (e.g., embedding size differences)
     missing_keys, unexpected_keys = model.load_state_dict(ckpt, strict=False)
@@ -392,7 +416,47 @@ def load_stage1_checkpoint(model, checkpoint_path, logger):
     logger.info("Stage 1 checkpoint loaded successfully")
     return model
 
-
+# --- Helper: Robust model saving for Opacus/LoRA/DDP ---
+def _save_model(model, save_dir: str, logger=None):
+    """
+    Recursively unwrap the model to find the underlying PeftModel or Transformers model
+    that has 'save_pretrained'.
+    """
+    # 递归解包，直到找到 save_pretrained 方法或者没有 _module 属性为止
+    # Opacus 使用 ._module, DDP 使用 .module
+    unwrap_model = model
+    wrap_layers = []
+    while hasattr(unwrap_model, "_module") or hasattr(unwrap_model, "module"):
+        if hasattr(unwrap_model, "_module"):
+            wrap_layers.append(type(unwrap_model).__name__)
+            unwrap_model = unwrap_model._module
+        elif hasattr(unwrap_model, "module"):
+            wrap_layers.append(type(unwrap_model).__name__)
+            unwrap_model = unwrap_model.module
+        else:
+            break
+    
+    if logger:
+        logger.info(f"Saving model to {save_dir}")
+        if wrap_layers:
+            logger.info(f"Unwrapped layers: {' -> '.join(wrap_layers)}")
+        logger.info(f"Final model type: {type(unwrap_model).__name__}")
+            
+    # 此时 unwrap_model 应该是 PeftModel 或 TypeAwareGPT2
+    if hasattr(unwrap_model, "save_pretrained"):
+        # 对于 PeftModel，这只会保存 adapter_model.bin (LoRA权重)
+        # 这正是我们想要的，因为 Base Model 是冻结的且已经有 Stage 1 存档
+        unwrap_model.save_pretrained(save_dir)
+        if logger:
+            saved_files = [f for f in os.listdir(save_dir) if os.path.isfile(os.path.join(save_dir, f))]
+            logger.info(f"Saved files: {', '.join(saved_files)}")
+    else:
+        # 兜底方案
+        model_path = os.path.join(save_dir, "pytorch_model.bin")
+        torch.save(unwrap_model.state_dict(), model_path)
+        if logger:
+            file_size = os.path.getsize(model_path) / (1024 * 1024)  # MB
+            logger.info(f"Saved state_dict to {model_path} ({file_size:.2f} MB)")
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -451,7 +515,7 @@ def main():
         logger.info(f"Resizing embeddings from {embedding_size} to {len(tokenizer)}")
         model.resize_token_embeddings(len(tokenizer))
         #重新绑定权重，确保 LM Head 同步更新
-        model.tie_weights()
+        # model.tie_weights() #Opacus 不支持 Tie Weights
     
     # Set type token IDs
     if hasattr(train_dataset, 'type_token_ids') and train_dataset.type_token_ids:
@@ -464,6 +528,15 @@ def main():
     # Move model to device (after checkpoint loading, before LoRA)
     model = model.to(args.device)
     
+    # --- FIX 2: 先运行 ModuleValidator (Opacus Compatibility) ---
+    # 必须在 LoRA 之前把 GPT2 的 Conv1D 换成 Linear，否则 LoRA 会挂在错误的层上
+    logger.info("Fixing model with ModuleValidator (Before LoRA)...")
+    try:
+        model = ModuleValidator.fix(model)
+        logger.info("Model fixed successfully")
+    except Exception as e:
+        logger.warning(f"ModuleValidator.fix failed: {e}")
+        
     # STEP 2: Apply LoRA
     logger.info("Applying LoRA...")
     lora_config = LoraConfig(
@@ -473,8 +546,8 @@ def main():
         task_type=TaskType.CAUSAL_LM,  # Use CAUSAL_LM for GPT2-based models
         bias="none",
         target_modules=["c_attn", "c_fc", "c_proj"],  # GPT2 modules
-        modules_to_save=["num_expert", "mixed_expert", "cat_expert", "lm_head"],
-        target_modules=["q_proj", "v_proj"]
+        modules_to_save=["num_expert", "mixed_expert", "cat_expert"],
+        # target_modules=["q_proj", "v_proj"]
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
@@ -566,6 +639,9 @@ def main():
                 batch = {k: (v.to(args.device) if isinstance(v, torch.Tensor) else v)
                         for k, v in batch.items()}
 
+                # Opacus requires fresh per-sample grad buffers each micro/mini-batch
+                optimizer.zero_grad(set_to_none=True)
+
                 # ✅ ⑥ strict：训练必须有 anchor
                 if "expert_token_idxs" not in batch:
                     raise ValueError("Training batch missing 'expert_token_idxs'. Dataset must provide anchor positions.")
@@ -585,7 +661,29 @@ def main():
                     num_bins=args.num_bins,
                 )
 
+                dummy_loss = 0.0
+                for p in model.parameters():
+                    if p.requires_grad:
+                        dummy_loss += p.sum() * 0.0
+                
+                loss = loss + dummy_loss
+
                 loss.backward()
+                if args.enable_privacy:
+                    bad = []
+                    for name, p in model.named_parameters():
+                        if not p.requires_grad:
+                            continue
+                        gs = getattr(p, "grad_sample", None)
+                        # gs 可能是 None，或者是空 list（某些版本/情况）
+                        if gs is None:
+                            bad.append(name)
+
+                    if bad:
+                        logger.error(f"grad_sample is None for {len(bad)} params. Examples: {bad[:20]}")
+                        raise ValueError("Some trainable params were not used in this forward/backward step.")
+
+
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -601,8 +699,7 @@ def main():
                 if global_step % args.save_steps == 0:
                     save_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                     mkdir(save_dir)
-                    model.save_pretrained(save_dir)
-                    logger.info(f"Checkpoint saved at {save_dir}")
+                    _save_model(model, save_dir, logger=logger)
 
         finally:
             if ctx is not None:
@@ -614,9 +711,9 @@ def main():
     # Save final model
     final_dir = os.path.join(args.output_dir, "final")
     mkdir(final_dir)
-    model.save_pretrained(final_dir)
-    logger.info(f"Final model saved at {final_dir}")
+    _save_model(model, final_dir, logger=logger)
 
 
 if __name__ == "__main__":
     main()
+

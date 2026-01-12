@@ -169,8 +169,13 @@ class TypeAwareGPT2(GPT2PreTrainedModel):
         expert_token_idxs=None, 
         col_type_ids=None,
         output_expert_logits=True,
+        labels=None,  # labels may be passed by wrappers (e.g., PEFT); we handle manually
         **kwargs
     ):
+        # Drop labels to avoid passing to the GPT2 transformer, we compute loss externally
+        if labels is not None:
+            kwargs.pop("labels", None)
+
         # 1. Backbone
         out = self.transformer(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
         hidden_states = out[0] if isinstance(out, tuple) else out.last_hidden_state
