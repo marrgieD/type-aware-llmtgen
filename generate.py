@@ -181,13 +181,42 @@ def sample_from_expert(expert_outputs, col_name, col_type, col_meta, device, tem
             values.append(str(v))
         return values
     
+    # elif col_type == "categorical":
+    #     cat_logits = expert_outputs["cat_logits"]
+    #     cat_probs = F.softmax(cat_logits / temperature, dim=-1)
+    #     cat_id = torch.multinomial(cat_probs, 1).squeeze(-1)
+        
+    #     categories = col_meta["categories"]
+    #     vocab = categories["unique"]
+    #     unk_id = categories.get("unk_id", 0) 
+        
+    #     cat_id_np = cat_id.cpu().numpy()
+    #     values = []
+    #     for i in range(len(cat_id_np)):
+    #         cid = int(cat_id_np[i])
+    #         if 0 <= cid < len(vocab):
+    #             values.append(str(vocab[cid]))
+    #         else:
+    #             values.append(str(vocab[unk_id]))
+    #     return values
     elif col_type == "categorical":
         cat_logits = expert_outputs["cat_logits"]
+        
+        # 获取当前列的类别信息
+        categories = col_meta["categories"]
+        vocab = categories["unique"]
+        vocab_len = len(vocab) # 比如 Income=2
+
+        # ================= 🔥🔥🔥 Logit Masking 修复 🔥🔥🔥 =================
+        # 强制屏蔽非法类别索引。如果模型输出维度 (43) 大于当前列实际类别数 (2)，
+        # 将 index >= 2 的位置设为 -inf，防止采样到非法值导致 [UNK]/NaN
+        if vocab_len < cat_logits.size(-1):
+            cat_logits[:, vocab_len:] = -float('inf')
+        # ====================================================================
+
         cat_probs = F.softmax(cat_logits / temperature, dim=-1)
         cat_id = torch.multinomial(cat_probs, 1).squeeze(-1)
         
-        categories = col_meta["categories"]
-        vocab = categories["unique"]
         unk_id = categories.get("unk_id", 0) 
         
         cat_id_np = cat_id.cpu().numpy()
@@ -199,7 +228,6 @@ def sample_from_expert(expert_outputs, col_name, col_type, col_meta, device, tem
             else:
                 values.append(str(vocab[unk_id]))
         return values
-    
     elif col_type == "mixed":
         mask_logits = expert_outputs["mixed_mask_logits"]
         bin_logits = expert_outputs["mixed_bin_logits"]

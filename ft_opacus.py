@@ -372,7 +372,6 @@ def parse_args():
     
     return parser.parse_args()
 
-
 def load_stage1_checkpoint(model, checkpoint_path, logger):
     """Load Stage 1 checkpoint weights into base model (before LoRA is applied)."""
     logger.info(f"Loading Stage 1 checkpoint from {checkpoint_path}")
@@ -383,38 +382,81 @@ def load_stage1_checkpoint(model, checkpoint_path, logger):
             for k in f.keys():
                 ckpt[k] = f.get_tensor(k)
     else:
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        ckpt = torch.load(checkpoint_path, map_location="cpu") # weights_only=False if needed
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             ckpt = ckpt["model_state_dict"]
     
-    # Handle potential vocab-size mismatch for categorical head
-    def _drop_if_shape_mismatch(key):
-        if key in ckpt:
-            saved_shape = ckpt[key].shape
-            target_shape = model.state_dict()[key].shape
-            if saved_shape != target_shape:
-                logger.warning(
-                    f"Drop mismatched key '{key}': ckpt {saved_shape} vs model {target_shape}"
-                )
-                ckpt.pop(key)
+    # ================= 🚀 核心修改：清洗僵尸权重 =================
+    # 强制删除所有包含 'expert' 的权重，确保 Stage 2 从随机初始化的 Expert 开始训练
+    # 这样可以避免 Stage 1 的伪数据分布对 Stage 2 产生“负迁移”
+    keys_to_drop = []
+    for k in ckpt.keys():
+        if "expert" in k:
+            keys_to_drop.append(k)
+            
+    if len(keys_to_drop) > 0:
+        logger.info(f"Dropping {len(keys_to_drop)} expert keys from Stage 1 checkpoint (to avoid negative transfer).")
+        # 打印几个例子确认一下
+        logger.info(f"Examples: {keys_to_drop[:3]}")
+        
+    for k in keys_to_drop:
+        del ckpt[k]
+    # ==========================================================
 
-    _drop_if_shape_mismatch("cat_expert.cat_head.weight")
-    _drop_if_shape_mismatch("cat_expert.cat_head.bias")
-
-    # At this point, model is still the base TypeAwareGPT2 (no LoRA applied yet)
-    # Load with strict=False to handle potential key mismatches (e.g., embedding size differences)
+    # Load with strict=False to handle missing expert keys
     missing_keys, unexpected_keys = model.load_state_dict(ckpt, strict=False)
-    if missing_keys:
-        logger.warning(f"Missing keys (first 10): {missing_keys[:10]}")
-        if len(missing_keys) > 10:
-            logger.warning(f"... and {len(missing_keys) - 10} more missing keys")
-    if unexpected_keys:
-        logger.warning(f"Unexpected keys (first 10): {unexpected_keys[:10]}")
-        if len(unexpected_keys) > 10:
-            logger.warning(f"... and {len(unexpected_keys) - 10} more unexpected keys")
     
-    logger.info("Stage 1 checkpoint loaded successfully")
+    # 这里的 logging 可以稍微简化，因为我们要 drop 很多 keys，missing 是预期的
+    if missing_keys:
+        # 过滤掉 expert 相关的 missing 警告，只关心其他的
+        real_missing = [k for k in missing_keys if "expert" not in k]
+        if real_missing:
+            logger.warning(f"Missing keys (excluding experts): {real_missing[:10]}")
+    
+    logger.info("Stage 1 checkpoint loaded successfully (Experts reset)")
     return model
+# def load_stage1_checkpoint(model, checkpoint_path, logger):
+#     """Load Stage 1 checkpoint weights into base model (before LoRA is applied)."""
+#     logger.info(f"Loading Stage 1 checkpoint from {checkpoint_path}")
+    
+#     if "safetensors" in checkpoint_path:
+#         ckpt = {}
+#         with safe_open(checkpoint_path, framework="pt") as f:
+#             for k in f.keys():
+#                 ckpt[k] = f.get_tensor(k)
+#     else:
+#         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+#         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+#             ckpt = ckpt["model_state_dict"]
+    
+#     # Handle potential vocab-size mismatch for categorical head
+#     def _drop_if_shape_mismatch(key):
+#         if key in ckpt:
+#             saved_shape = ckpt[key].shape
+#             target_shape = model.state_dict()[key].shape
+#             if saved_shape != target_shape:
+#                 logger.warning(
+#                     f"Drop mismatched key '{key}': ckpt {saved_shape} vs model {target_shape}"
+#                 )
+#                 ckpt.pop(key)
+
+#     _drop_if_shape_mismatch("cat_expert.cat_head.weight")
+#     _drop_if_shape_mismatch("cat_expert.cat_head.bias")
+
+#     # At this point, model is still the base TypeAwareGPT2 (no LoRA applied yet)
+#     # Load with strict=False to handle potential key mismatches (e.g., embedding size differences)
+#     missing_keys, unexpected_keys = model.load_state_dict(ckpt, strict=False)
+#     if missing_keys:
+#         logger.warning(f"Missing keys (first 10): {missing_keys[:10]}")
+#         if len(missing_keys) > 10:
+#             logger.warning(f"... and {len(missing_keys) - 10} more missing keys")
+#     if unexpected_keys:
+#         logger.warning(f"Unexpected keys (first 10): {unexpected_keys[:10]}")
+#         if len(unexpected_keys) > 10:
+#             logger.warning(f"... and {len(unexpected_keys) - 10} more unexpected keys")
+    
+#     logger.info("Stage 1 checkpoint loaded successfully")
+#     return model
 
 # --- Helper: Robust model saving for Opacus/LoRA/DDP ---
 def _save_model(model, save_dir: str, logger=None):
@@ -457,7 +499,12 @@ def _save_model(model, save_dir: str, logger=None):
         if logger:
             file_size = os.path.getsize(model_path) / (1024 * 1024)  # MB
             logger.info(f"Saved state_dict to {model_path} ({file_size:.2f} MB)")
+import warnings
+
 def main():
+    # 过滤包含 "non-full backward hook" 关键词的警告
+    warnings.filterwarnings("ignore", message=".*non-full backward hook.*", category=FutureWarning)
+
     args = parse_args()
     set_seed(args.seed)
     
