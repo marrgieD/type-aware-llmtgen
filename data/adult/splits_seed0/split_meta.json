@@ -1,0 +1,32 @@
+{
+  "input_csv": "./data/adult/adult.csv",
+  "seed": 0,
+  "target_col": "income",
+  "test_size": 0.2,
+  "val_size_within_train": 0.1,
+  "n_total": 48790,
+  "n_train": 35128,
+  "n_val": 3904,
+  "n_test": 9758,
+  "label_dist_total": {
+    "<=50k": 0.7605861856937897,
+    ">50k": 0.23941381430621028
+  },
+  "label_dist_train": {
+    "<=50k": 0.7605898428603962,
+    ">50k": 0.23941015713960373
+  },
+  "label_dist_val": {
+    "<=50k": 0.7605020491803278,
+    ">50k": 0.23949795081967212
+  },
+  "label_dist_test": {
+    "<=50k": 0.760606681697069,
+    ">50k": 0.23939331830293092
+  },
+  "paths": {
+    "train": "./data/adult/splits_seed0/train.csv",
+    "val": "./data/adult/splits_seed0/val.csv",
+    "test": "./data/adult/splits_seed0/test.csv"
+  }
+}

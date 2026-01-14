@@ -7,11 +7,12 @@ TEST_PATH="./data/adult/adult.csv"
 # 您的文件名
 FAKE_PATHS=(
     # "./synthetic_data_episilon1.csv"
-    "./synthetic_data_episilon2.csv"
+    # "./synthetic_data_episilon2.csv"
     # "./synthetic_data_episilon05.csv"
-    "./synthetic_data_episilon2_new.csv"
+    # "./synthetic_data_episilon2_new.csv"
     # "./synthetic_data_episilon2_newt07.csv"
     "./synthetic_data_episilon2_nnew.csv"
+    "./synthetic_data_episilon1_nnew.csv"
 )
 
 # 创建结果文件夹

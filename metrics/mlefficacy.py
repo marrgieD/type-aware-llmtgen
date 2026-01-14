@@ -130,66 +130,74 @@ class MLEfficacy(object):
         self.predictions = None
 
     def _score(self, scorer, real_target, predictions, probabilities):
-        """Score the trained model."""
-        # print(real_target[0], predictions[0], probabilities[0])
-        unique_labels, class_counts = np.unique(real_target, return_counts=True)
+            """Score the trained model."""
+            unique_labels, class_counts = np.unique(real_target, return_counts=True)
+            
+            # 检查是否混入了新类别 (脏数据检查)
+            unique_preds = np.unique(predictions)
+            all_classes = np.union1d(unique_labels, unique_preds)
+            is_multiclass = len(all_classes) > 2
 
-        if scorer is None:
-            if self._task == "classification":
-                if len(unique_labels) > 2:
-                    # multiclass
-                    scorer = lambda **kwargs: f1_score(**kwargs, average="micro")
+            # 1. 定义评分规则 (Scorer Definition)
+            if scorer is None:
+                if self._task == "classification":
+                    if is_multiclass:
+                        scorer = lambda **kwargs: f1_score(**kwargs, average="micro")
+                    else:
+                        class_to_report = np.argmin(class_counts)
+                        label_val = unique_labels[class_to_report]
+                        scorer = lambda **kwargs: f1_score(**kwargs, pos_label=label_val)
                 else:
-                    class_to_report = np.argmin(class_counts)
-                    scorer = lambda **kwargs: f1_score(
-                        **kwargs, pos_label=class_to_report
-                    )
-            else:
-                scorer = lambda **kwargs: r2_score(**kwargs)
-        elif isinstance(scorer, str):
-            if scorer == "f1":
-                if len(unique_labels) > 2:
-                    # multiclass
-                    scorer = lambda **kwargs: f1_score(**kwargs, average="micro")
+                    scorer = lambda **kwargs: r2_score(**kwargs)
+
+            elif isinstance(scorer, str):
+                if scorer == "f1":
+                    if is_multiclass:
+                        scorer = lambda **kwargs: f1_score(**kwargs, average="micro")
+                    else:
+                        class_to_report = np.argmin(class_counts)
+                        label_val = unique_labels[class_to_report]
+                        scorer = lambda **kwargs: f1_score(**kwargs, pos_label=label_val)
+
+                elif scorer == "auc":
+                    # AUC 比较特殊，使用的是概率 (probabilities)
+                    if len(probabilities.shape) == 1:
+                        # 只有一列概率
+                        input_pred = probabilities
+                        scorer = lambda y_true, y_pred: roc_auc_score(y_true, y_pred)
+                    elif is_multiclass:
+                        # 多分类 AUC
+                        input_pred = probabilities
+                        scorer = lambda y_true, y_pred: roc_auc_score(y_true, y_pred, average="micro", multi_class='ovr')
+                    else:
+                        # 二分类，取少数类的概率
+                        class_to_report = np.argmin(class_counts)
+                        # 保护：防止 probabilities 列数少于 class_to_report (虽然极少见)
+                        if probabilities.shape[1] > class_to_report:
+                            input_pred = probabilities[:, class_to_report]
+                        else:
+                            input_pred = probabilities[:, 0] # Fallback
+                        scorer = lambda y_true, y_pred: roc_auc_score(y_true, y_pred)
+                
+                elif scorer == "accuracy":
+                    scorer = accuracy_score
+                    input_pred = predictions # Accuracy 用的是硬分类预测
+
+            # 确定 input_pred：如果是 AUC，上面已经把 input_pred 指向了概率；否则默认是 predictions
+            # 注意：上面的逻辑里，非 AUC 的情况我们没有设置 input_pred，这里补一下
+            if scorer != "auc" and 'input_pred' not in locals():
+                input_pred = predictions
+
+            # 2. 执行评分 (Execution with Safety Net)
+            try:
+                if isinstance(scorer, (list, tuple)):
+                    return tuple((s(y_true=real_target, y_pred=input_pred) for s in scorer))
                 else:
-                    class_to_report = np.argmin(class_counts)
-                    scorer = lambda **kwargs: f1_score(
-                        **kwargs, pos_label=class_to_report
-                    )
-            elif scorer == "auc":
-                if len(probabilities.shape) == 1:
-                    predictions = probabilities
-                    scorer = lambda y_true, y_pred: roc_auc_score(
-                        y_true=y_true, y_score=y_pred
-                    )
-                elif len(unique_labels) > 2:
-                    # multiclass
-                    predictions = probabilities
-                    scorer = lambda y_true, y_pred: roc_auc_score(
-                        y_true=y_true, y_score=y_pred, average="micro"
-                    )
-                else:
-                    class_to_report = np.argmin(class_counts)
-                    predictions = probabilities[:, class_to_report]
-                    scorer = lambda y_true, y_pred: roc_auc_score(
-                        y_true=y_true, y_score=y_pred
-                    )
-
-            elif scorer == "accuracy":
-                scorer = accuracy_score
-
-        # import pdb;
-        # pdb.set_trace()
-        # print(predictions[0])
-        if isinstance(scorer, (list, tuple)):
-            scorers = scorer
-            return tuple(
-                (scorer(y_true=real_target, y_pred=predictions) for scorer in scorers)
-            )
-
-        else:
-            return scorer(y_true=real_target, y_pred=predictions)
-
+                    return scorer(y_true=real_target, y_pred=input_pred)
+            except ValueError as e:
+                # 捕获所有维度不匹配、类别不匹配的错误
+                print(f"Warning: Metric calculation failed due to: {e}. Returning 0.0")
+                return 0.0
     def _fit_predict(self, synthetic_data, synthetic_target, real_data):
         """Fit a model on the synthetic data and make predictions for the real data."""
 

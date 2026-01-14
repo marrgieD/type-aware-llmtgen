@@ -1,0 +1,28 @@
+{
+  "1-way_tvd_mean": 0.3124366259396273,
+  "1-way_tvd_std_across_seeds": 0.0,
+  "1-way_tvd_within_subset_std_mean": 0.20771117836728928,
+  "2-way_tvd_mean": 0.48797857514030474,
+  "2-way_tvd_std_across_seeds": 0.0,
+  "2-way_tvd_within_subset_std_mean": 0.17383473571916816,
+  "3-way_tvd_mean": 0.6111634758368357,
+  "3-way_tvd_std_across_seeds": 0.0,
+  "3-way_tvd_within_subset_std_mean": 0.14843181387805865,
+  "4-way_tvd_mean": 0.7317498095100502,
+  "4-way_tvd_std_across_seeds": 0.0,
+  "4-way_tvd_within_subset_std_mean": 0.1315956019018994,
+  "5-way_tvd_mean": 0.8293738868604237,
+  "5-way_tvd_std_across_seeds": 0.0,
+  "5-way_tvd_within_subset_std_mean": 0.09782323364165087,
+  "xgb_acc_mean": 0.7589670014347202,
+  "xgb_acc_std": 0.0,
+  "xgb_auc_mean": 0.5055051704392347,
+  "xgb_auc_std": 0.0,
+  "n_quantiles": 20,
+  "tvd_subset_num": 300,
+  "seeds": [
+    0
+  ],
+  "num_cols_n": 6,
+  "cat_cols_n": 8
+}
