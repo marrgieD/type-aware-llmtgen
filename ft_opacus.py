@@ -22,7 +22,6 @@ from opacus import PrivacyEngine
 from opacus.utils.batch_memory_manager import BatchMemoryManager
 from opacus.validators import ModuleValidator
 from safetensors import safe_open
-
 from utils.models import TypeAwareGPT2
 from utils.dataset import LLMtgDataset, get_metadata
 from utils.misc import mkdir
@@ -369,7 +368,8 @@ def parse_args():
                        help="Save checkpoint every N steps")
     parser.add_argument("--logging_steps", type=int, default=100,
                        help="Log every N steps")
-    
+    parser.add_argument("--target_col", type=str, default=None, 
+                       help="The target column name to move to the first position (Target-First Strategy).")
     return parser.parse_args()
 
 def load_stage1_checkpoint(model, checkpoint_path, logger):
@@ -526,6 +526,16 @@ def main():
     # Load dataset
     import pandas as pd
     train_df = pd.read_csv(args.train_file)
+    # ================= 🚀 新增：Target-First 重排逻辑 =================
+    if args.target_col:
+        # 为了鲁棒性，先检查一下列名是否存在（这里不做 lower() 处理，保持原样匹配）
+        if args.target_col in train_df.columns:
+            logger.info(f"Applying Target-First strategy: Moving '{args.target_col}' to the first column.")
+            # 将 target 移到第一列，其余列保持原序
+            cols = [args.target_col] + [c for c in train_df.columns if c != args.target_col]
+            train_df = train_df[cols]
+        else:
+            logger.warning(f"Target column '{args.target_col}' not found in training data! Skipping reordering.")
     train_dataset = LLMtgDataset.from_pandas(train_df)
     train_dataset.set_serializer("great")
     train_dataset.set_tokenizer(tokenizer)

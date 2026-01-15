@@ -358,7 +358,8 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_bins", type=int, default=100)
-    
+    parser.add_argument("--target_col", type=str, default=None, 
+                       help="The target column name to move to the first position.")
     # DDP args
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
     
@@ -400,6 +401,15 @@ def main():
     if is_main_process:
         logger.info(f"Loading training data from {args.train_data_path}")
     train_df = pd.read_csv(args.train_data_path)
+    # ================= 🚀 新增：Target-First 重排逻辑 =================
+    if args.target_col:
+        if args.target_col in train_df.columns:
+            if is_main_process:
+                logger.info(f"Applying Target-First strategy: Moving '{args.target_col}' to the first column.")
+            cols = [args.target_col] + [c for c in train_df.columns if c != args.target_col]
+            train_df = train_df[cols]
+        elif is_main_process:
+            logger.warning(f"Target column '{args.target_col}' not found in metadata file! Skipping reordering.")
     metadata = get_metadata(train_df)
     
     if args.num_samples is None:

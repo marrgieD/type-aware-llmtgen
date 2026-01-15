@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ================= 配置区域 =================
-TRAIN_PATH="./data/adult/adult.csv"
-TEST_PATH="./data/adult/adult.csv"
+TRAIN_PATH="./data/adult/train.csv"
+TEST_PATH="./data/adult/train.csv"
 
 # 您的文件名
 FAKE_PATHS=(
@@ -11,8 +11,11 @@ FAKE_PATHS=(
     # "./synthetic_data_episilon05.csv"
     # "./synthetic_data_episilon2_new.csv"
     # "./synthetic_data_episilon2_newt07.csv"
-    "./synthetic_data_episilon2_nnew.csv"
-    "./synthetic_data_episilon1_nnew.csv"
+    # "./synthetic_data_episilon2_nnew.csv"
+    # "./synthetic_data_episilon1_nnew.csv"
+    # "./synthetic_data_episilon0_restage1.csv"
+    "./data/synthetic/adult_stage2_impute-False/raw_tables/dp_synth256_nodp.csv"
+    "./data/synthetic/adult_stage2_impute-True/raw_tables/dp_synth256.csv"
 )
 
 # 创建结果文件夹
