@@ -373,6 +373,12 @@ def parse_args():
                        help="The target column name to move to the first position (Target-First Strategy).")
     parser.add_argument("--max_length", type=int, default=256,
                     help="Training truncation length to match generation window.")
+
+    parser.add_argument("--overfit_n", type=int, default=0,
+                    help="If >0, overfit on first N rows for debugging.")
+    parser.add_argument("--disable_dropout", action="store_true",
+                    help="Disable dropout during training (debug).")
+     
     return parser.parse_args()
 
 def load_stage1_checkpoint(model, checkpoint_path, logger):
@@ -512,6 +518,10 @@ def evaluate(model, dataloader, device, tokenizer, target_col_name=None, dataset
     3. Target UNK Rate (Collapse 监控 - 看看模型是不是只会预测 UNK)
     4. Expert Accuracy (Structure Proxy - 看看 Expert 能不能猜对类别)
     """
+    per_col_correct = None
+    per_col_total = None
+    per_col_majority_correct = None  # baseline: always predict majority class
+    majority_ids = None
     model.eval()
     
     total_lm_loss = 0.0
@@ -570,17 +580,68 @@ def evaluate(model, dataloader, device, tokenizer, target_col_name=None, dataset
         # 3. Structure Proxy: Expert Accuracy (Categorical)
         # 看看 Expert 对分类列的预测准不准，作为“结构相关性”的代理指标
         if "cat_logits" in outputs["expert_outputs"] and batch.get("cat_id") is not None:
-            cat_logits = outputs["expert_outputs"]["cat_logits"] # [Batch, Num_Cat_Cols, Vocab]
-            cat_preds = torch.argmax(cat_logits, dim=-1)
-            cat_labels = batch["cat_id"]
-            
-            # 只计算有效位置
+            cat_logits = outputs["expert_outputs"]["cat_logits"]  # [B, C, V]
+            cat_preds = torch.argmax(cat_logits, dim=-1)          # [B, C]
+            cat_labels = batch["cat_id"]                          # [B, C]
             mask_cat = (cat_labels != -100)
-            if mask_cat.any():
-                correct = (cat_preds == cat_labels) & mask_cat
-                expert_correct += correct.sum().item()
-                expert_total += mask_cat.sum().item()
 
+            B, C = cat_labels.shape
+
+            # lazy init
+            if per_col_correct is None:
+                per_col_correct = torch.zeros(C, dtype=torch.long)
+                per_col_total = torch.zeros(C, dtype=torch.long)
+
+                # ✅ 这里计算 majority baseline：用“整个验证集 labels”统计最频繁类别
+                # 简化做法：先在第一次 batch 初始化一个 dict 计数，最后再转 majority_ids
+                per_col_counts = [dict() for _ in range(C)]
+            # 先统计每列 label 频次（为了 majority baseline）
+            for j in range(C):
+                lj = cat_labels[:, j]
+                mj = mask_cat[:, j]
+                if mj.any():
+                    vals = lj[mj].detach().cpu().tolist()
+                    d = per_col_counts[j]
+                    for v in vals:
+                        d[v] = d.get(v, 0) + 1
+
+            # per-column accuracy
+            for j in range(C):
+                mj = mask_cat[:, j]
+                if mj.any():
+                    per_col_correct[j] += (cat_preds[:, j][mj] == cat_labels[:, j][mj]).sum().detach().cpu()
+                    per_col_total[j] += mj.sum().detach().cpu()
+
+    per_col_acc = None
+    per_col_majority_acc = None
+
+    if per_col_correct is not None:
+        # 计算每列 majority 类别
+        majority_ids = []
+        for j in range(len(per_col_counts)):
+            d = per_col_counts[j]
+            if len(d) == 0:
+                majority_ids.append(None)
+            else:
+                majority_ids.append(max(d.items(), key=lambda x: x[1])[0])
+
+        # 重新跑一遍 dataloader 做 majority baseline（简单且不改动 batch 结构）
+        # 为了省事，我们用 per_col_counts 推出来的 majority_ids，直接在已有统计上给 baseline 估计：
+        # baseline_correct = sum(mask_cat & (label==majority_id))
+        # 由于我们没保存所有 label，这里用 per_col_counts 的最大频次 / 总数作为 baseline acc：
+        per_col_majority_acc = []
+        per_col_acc = []
+        for j in range(len(per_col_counts)):
+            tot = int(per_col_total[j].item())
+            if tot == 0 or majority_ids[j] is None:
+                per_col_acc.append(None)
+                per_col_majority_acc.append(None)
+            else:
+                # 真实模型 acc
+                per_col_acc.append(float(per_col_correct[j].item()) / (tot + 1e-8))
+                # baseline acc = max_count / total
+                max_count = max(per_col_counts[j].values())
+                per_col_majority_acc.append(float(max_count) / (tot + 1e-8))
     # 汇总指标
     avg_lm_loss = total_lm_loss / total_steps
     avg_expert_loss = total_expert_loss / total_steps
@@ -598,8 +659,10 @@ def evaluate(model, dataloader, device, tokenizer, target_col_name=None, dataset
         "val_lm_loss": avg_lm_loss,
         "val_ppl": perplexity,
         "val_expert_loss": avg_expert_loss,
-        "val_unk_rate": unk_rate,       # 对应 Target UNK / Collapse
-        "val_expert_acc": expert_acc    # 对应 Structure Proxy
+        "val_unk_rate": unk_rate,
+        "val_expert_acc": expert_acc,
+        "val_per_col_acc": per_col_acc,
+        "val_per_col_majority_acc": per_col_majority_acc,
     }
 def main():
     # 过滤包含 "non-full backward hook" 关键词的警告
@@ -626,6 +689,11 @@ def main():
     # Load dataset
     import pandas as pd
     train_df = pd.read_csv(args.train_file)
+    if args.overfit_n and args.overfit_n > 0:
+        train_df = train_df.iloc[:args.overfit_n].copy()
+        logger.warning(f"[DEBUG] Overfitting mode: using first {len(train_df)} rows only.")
+        args.enable_privacy = False
+        # 强制关闭隐私（过拟合就是要看能不能学到）
     # ================= 🚀 新增：Target-First 重排逻辑 =================
     if args.target_col:
         # 为了鲁棒性，先检查一下列名是否存在（这里不做 lower() 处理，保持原样匹配）
@@ -696,7 +764,14 @@ def main():
         logger.info("Model fixed successfully")
     except Exception as e:
         logger.warning(f"ModuleValidator.fix failed: {e}")
-        
+        # ✅ Debug: disable dropout（放在 make_private 之前）
+
+    if getattr(args, "disable_dropout", False):
+        logger.warning("[DEBUG] Disabling dropout (set all Dropout.p=0).")
+        for m in model.modules():
+            if isinstance(m, torch.nn.Dropout):
+                m.p = 0.0
+
     # STEP 2: Apply LoRA
     logger.info("Applying LoRA...")
     lora_config = LoraConfig(
@@ -780,10 +855,6 @@ def main():
             drop_last=False
         )
 
-    # Training loop
-    model.train()
-    global_step = 0
-    # ... (progress bar init) ...
 
     # 定义验证频率 (例如每 200 step 或每个 epoch)
     eval_steps = args.logging_steps * 4
@@ -888,6 +959,7 @@ def main():
                         dataset_metadata=train_dataset.metadata
                     )
                     
+
                     logger.info(
                         f"[VALID] Step={global_step} | "
                         f"Val_LM_Loss={metrics['val_lm_loss']:.4f} | "
@@ -896,7 +968,13 @@ def main():
                         f"Val_UNK_Rate={metrics['val_unk_rate']:.4f} | " # UNK: 是不是 Collapse 了
                         f"Val_Exp_Acc={metrics['val_expert_acc']:.4f}"   # Acc: 结构对不对
                     )
-                    
+                    accs = metrics.get("val_per_col_acc")
+                    baccs = metrics.get("val_per_col_majority_acc")
+                    if accs and baccs:
+                        # 找差距最大的列：acc - baseline
+                        diffs = [(i, (accs[i] or 0) - (baccs[i] or 0), accs[i], baccs[i]) for i in range(len(accs)) if accs[i] is not None]
+                        diffs.sort(key=lambda x: x[1])  # 最差在前
+                        logger.info("Per-col worst 5 (idx, acc-baseline, acc, baseline): " + str(diffs[:5]))
                     # 💡 简单的 Early Stopping / Collapse Check 逻辑
                     if metrics['val_unk_rate'] > 0.10: # 阈值可调，比如 10%
                         logger.warning(f"⚠️ Warning: UNK Rate is high ({metrics['val_unk_rate']:.2%}). Model might be collapsing!")
