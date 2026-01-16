@@ -269,26 +269,37 @@ def sample_from_expert(expert_outputs, col_name, col_type, col_meta, device, tem
                 values.append(str(v))
         return values
 
-
 def generate_column_batch(model, tokenizer, prompts, col_name, col_type, col_meta, metadata, device, temperature=1.0, key_val_sep="is"):
     type_token_map = {"numerical": "[NUM]", "categorical": "[CAT]", "mixed": "[MIX]"}
     type_token = type_token_map.get(col_type, "[NUM]")
     prefix = f"{type_token} {col_name} {key_val_sep}"
     
+    # 构造 Prompt
     full_prompts = [(p + " " + prefix) if p and not p.endswith(" ") else (p + prefix) for p in prompts]
     
     encoded = tokenizer(full_prompts, return_tensors="pt", padding=True, truncation=True, max_length=512)
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded["attention_mask"].to(device)
     
+    # ================= 🚀 核心修复：把 no_grad 范围扩大到最后！ =================
     with torch.no_grad():
-        transformer_outputs = model.transformer(input_ids=input_ids, attention_mask=attention_mask)
+        # 1. Backbone 计算
+        transformer_outputs = model.transformer(
+            input_ids=input_ids, 
+            attention_mask=attention_mask
+        )
         last_hidden_states = transformer_outputs[0]
-    
-    seq_lengths = attention_mask.sum(dim=1) - 1
-    col_hidden_states = torch.cat([last_hidden_states[i, int(l):int(l)+1] for i, l in enumerate(seq_lengths)], dim=0).unsqueeze(1)
-    
-    with torch.no_grad():
+
+        # 2. 提取 Hidden State (保留高级索引优化)
+        batch_size = last_hidden_states.size(0)
+        last_token_indices = attention_mask.sum(dim=1) - 1
+        col_hidden_states = last_hidden_states[torch.arange(batch_size, device=device), last_token_indices]
+        col_hidden_states = col_hidden_states.unsqueeze(1) # [Batch, 1, Hidden]
+
+        # 3. Expert 计算 (必须在 no_grad 里面！)
+        # 上次就是这里漏在外面了，导致 output 带上了梯度
+        expert_outputs = {}
+        
         if col_type == "numerical":
             bin_logits, residual = model.num_expert(col_hidden_states)
             expert_outputs = {"num_bin_logits": bin_logits.squeeze(1), "num_residual": residual.squeeze(1)}
@@ -299,10 +310,10 @@ def generate_column_batch(model, tokenizer, prompts, col_name, col_type, col_met
             mask_logits, bin_logits, residual = model.mixed_expert(col_hidden_states)
             expert_outputs = {"mixed_mask_logits": mask_logits.squeeze(1), "mixed_bin_logits": bin_logits.squeeze(1), "mixed_residual": residual.squeeze(1)}
     
+    # 离开 no_grad 块时，expert_outputs 里的 tensor 已经是 clean 的（无梯度），可以放心转 numpy
     return sample_from_expert(expert_outputs, col_name, col_type, col_meta, device, temperature)
-
-
-def generate_synthetic_data(model, tokenizer, dataset, metadata, num_samples, device, temperature=1.0, batch_size=32, logger=None, show_progress=True):
+    
+def generate_synthetic_data(model, tokenizer, dataset, metadata, num_samples, device, temperature=0.7, batch_size=32, logger=None, show_progress=True):
     column_names = dataset.column_names
     key_val_sep = "is" 
     
@@ -397,7 +408,12 @@ def main():
     tokenizer_name = args.tokenizer_name if args.tokenizer_name else args.model_name_or_path
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-    
+    special_tokens_dict = {
+        "additional_special_tokens": [
+            "[NUM]", "[CAT]", "[MIX]", "[BOS]", "[EOS]", "[EOC]", "[UNK]",
+        ]
+    }
+    tokenizer.add_special_tokens(special_tokens_dict)
     if is_main_process:
         logger.info(f"Loading training data from {args.train_data_path}")
     train_df = pd.read_csv(args.train_data_path)
