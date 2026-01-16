@@ -161,60 +161,57 @@ class TypeAwareGPT2(GPT2PreTrainedModel):
         col_positions = sorted_idxs[:, :expected_num_cols].contiguous()
         return col_positions
 
+
     def forward(
         self,
         input_ids=None,
         attention_mask=None,
         col_positions=None,
-        expert_token_idxs=None, 
+        expert_token_idxs=None,
         col_type_ids=None,
         output_expert_logits=True,
-        labels=None,  # labels may be passed by wrappers (e.g., PEFT); we handle manually
+        labels=None,
         **kwargs
     ):
-        # Drop labels to avoid passing to the GPT2 transformer, we compute loss externally
         if labels is not None:
             kwargs.pop("labels", None)
 
-        # 1. Backbone
+        # 1) backbone
         out = self.transformer(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
         hidden_states = out[0] if isinstance(out, tuple) else out.last_hidden_state
 
-        # 2. Resolve Positions
-        if col_positions is None and expert_token_idxs is not None:
-            col_positions = expert_token_idxs
-
-        # Strict Logic: No guessing allowed during training
-        if col_positions is None:
-            if col_type_ids is None:
-                raise ValueError("Training requires 'expert_token_idxs' or 'col_type_ids'. Cannot infer column count.")
-            
-            expected_num_cols = col_type_ids.shape[1]
-            col_positions = self._find_column_positions_vectorized(input_ids, expected_num_cols, col_type_ids)
-
-        # 3. Gather Hidden States [B, C, H]
-        col_hidden, valid_mask = self._gather_column_hidden_states(hidden_states, col_positions)
-
-        # 4. Expert Heads
-        num_bin_logits, num_residual = self.num_expert(col_hidden)
-        cat_logits = self.cat_expert(col_hidden) 
-        mixed_mask_logits, mixed_bin_logits, mixed_residual = self.mixed_expert(col_hidden)
-
-        # 5. LM Head
+        # 2) lm_head (始终可用)
         lm_logits = self.lm_head(hidden_states)
 
-        # If we don't need expert logits (e.g., pure LM usage), return early
+        # ✅ 关键：如果不需要 expert，就不要做列位置推断
         if not output_expert_logits:
             return {
                 "lm_logits": lm_logits,
-                # "transformer_outputs": transformer_outputs  # optional
+                "hidden_states": hidden_states,
             }
 
-        # Otherwise, return full outputs with experts
+        # 3) resolve positions
+        if col_positions is None and expert_token_idxs is not None:
+            col_positions = expert_token_idxs
+
+        if col_positions is None:
+            if col_type_ids is None:
+                raise ValueError("Training requires 'expert_token_idxs' or 'col_type_ids'. Cannot infer column count.")
+
+            expected_num_cols = col_type_ids.shape[1]
+            col_positions = self._find_column_positions_vectorized(input_ids, expected_num_cols, col_type_ids)
+
+        # 4) gather + experts
+        col_hidden, valid_mask = self._gather_column_hidden_states(hidden_states, col_positions)
+
+        num_bin_logits, num_residual = self.num_expert(col_hidden)
+        cat_logits = self.cat_expert(col_hidden)
+        mixed_mask_logits, mixed_bin_logits, mixed_residual = self.mixed_expert(col_hidden)
+
         return {
-            # "hidden_states": hidden_states,
+            "hidden_states": hidden_states,
             "col_positions": col_positions,
-            "valid_mask": valid_mask,   # ✅ Added this
+            "valid_mask": valid_mask,
             "lm_logits": lm_logits,
             "expert_outputs": {
                 "cat_logits": cat_logits,
