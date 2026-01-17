@@ -82,10 +82,19 @@ def calculate_data_stats(dataset):
     return max_cat_id + 1 if max_cat_id > 0 else 43
 
 
-def load_stage1_model(base_model_path, tokenizer, num_bins, cat_vocab_size, device, logger):
+def load_stage1_model(base_model_path, tokenizer, num_bins, 
+                     cat_vocab_size, device, logger, leaf_args=None):
     logger.info(f"Loading Stage 1 base model from {base_model_path}")
     
     config = AutoConfig.from_pretrained(base_model_path)
+    # ✅ MUST override BEFORE TypeAwareGPT2(config) so tensors have correct shapes
+    # Make leaf-hash hyperparams match training (must be set BEFORE loading adapter weights)
+    # Note: TypeAwareGPT2 reads these from config at init time, but we also set runtime flags for safety.
+    if leaf_args is not None:
+        setattr(config, "leaf_bits", int(leaf_args["leaf_bits"]))
+        setattr(config, "leaf_seed", int(leaf_args["leaf_seed"]))
+        setattr(config, "use_leaf_hash", bool(leaf_args["use_leaf_hash"]))
+        logger.info(f"Override config with leaf_args: {leaf_args}")
     model = TypeAwareGPT2(
         config=config,
         num_bins=num_bins,
@@ -367,7 +376,10 @@ def generate_column_batch(
         last_token_indices = attention_mask.sum(dim=1) - 1
         col_hidden_states = hidden_states[torch.arange(batch_size, device=device), last_token_indices]
         col_hidden_states = col_hidden_states.unsqueeze(1) # [Batch, 1, Hidden]
-
+        # ===== 1.5 Leaf conditioning (single source of truth in model) =====
+        if hasattr(model, "condition_with_leaf"):
+            col_hidden_states, _leaf_id = model.condition_with_leaf(col_hidden_states)
+        # ==================================================================
         # C. 丢给对应的 Expert Head
         expert_outputs = {}
         
@@ -457,6 +469,13 @@ def parse_args():
                        help="The target column name to move to the first position.")
     # DDP args
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
+    # ===== Leaf hash (Manifold Conditioning) =====
+    parser.add_argument("--leaf_bits", type=int, default=6,
+                       help="Number of hash bits k (num_leaf=2^k). Must match training.")
+    parser.add_argument("--leaf_seed", type=int, default=0,
+                       help="Frozen projection seed. Must match training.")
+    parser.add_argument("--disable_leaf_hash", action="store_true",
+                       help="Disable leaf hash conditioning (ablation).")
     
     return parser.parse_args()
 
@@ -536,14 +555,20 @@ def main():
     dataset.metadata = metadata
     real_cat_vocab_size = calculate_data_stats(dataset)
     
+    leaf_args = {
+        "leaf_bits": int(args.leaf_bits),
+        "leaf_seed": int(args.leaf_seed),
+        "use_leaf_hash": bool(not args.disable_leaf_hash),
+    }
     model = load_stage1_model(
         base_model_path=args.base_model_path,
         tokenizer=tokenizer,
         num_bins=args.num_bins,
         cat_vocab_size=real_cat_vocab_size,
         device=device,
-        logger=logger
-    )
+        logger=logger,
+        leaf_args=leaf_args
+    )          
     model = load_stage2_lora(model, args.lora_path, logger)
     
     # --- Generation ---

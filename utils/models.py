@@ -72,6 +72,37 @@ class TypeAwareGPT2(GPT2PreTrainedModel):
         self.register_buffer("num_token_id", torch.tensor(-1, dtype=torch.long))
         self.register_buffer("cat_token_id", torch.tensor(-1, dtype=torch.long))
         self.register_buffer("mix_token_id", torch.tensor(-1, dtype=torch.long))
+        # =========================================================
+        # 1.5 Manifold Conditioning (Leaf Hash)
+        #   h -> (frozen random projection + hash -> leaf_id) -> h' = h + leaf_emb[leaf_id]
+        #   - leaf_id computed under no_grad (no backprop through hash/proj)
+        #   - W_proj and leaf_powers are buffers (not in optimizer)
+        #   - leaf_emb is trainable (protected by DP-SGD)
+        # =========================================================
+        self.use_leaf_hash = bool(getattr(config, "use_leaf_hash", True))
+        self.leaf_bits = int(getattr(config, "leaf_bits", 6))   # k=6 => 64 leaves
+        self.leaf_seed = int(getattr(config, "leaf_seed", 0))
+        self.num_leaf = 2 ** self.leaf_bits
+
+        # Frozen random projection matrix (buffer)
+        g = torch.Generator()
+        g.manual_seed(self.leaf_seed)
+        W = torch.randn(hidden_size, self.leaf_bits, generator=g)
+        W = W / (W.norm(dim=0, keepdim=True) + 1e-12)  # optional normalization
+        self.register_buffer("W_proj", W, persistent=True)
+
+        # Binary to int powers (buffer)
+        self.register_buffer(
+            "leaf_powers",
+            (2 ** torch.arange(self.leaf_bits, dtype=torch.long)),
+            persistent=True
+        )
+
+        # Trainable leaf embedding table
+        self.leaf_emb = nn.Embedding(self.num_leaf, hidden_size)
+        # ✅ Zero init: step0 keeps identity mapping h'≈h, avoids early training noise
+        nn.init.zeros_(self.leaf_emb.weight)
+        # =========================================================
 
         if type_token_ids is not None:
             self.set_type_token_ids(type_token_ids)
@@ -161,6 +192,38 @@ class TypeAwareGPT2(GPT2PreTrainedModel):
         col_positions = sorted_idxs[:, :expected_num_cols].contiguous()
         return col_positions
 
+    # -----------------------------
+    # 1.5 Leaf Hash helpers (model-owned, single source of truth)
+    # -----------------------------
+    def _compute_leaf_id_no_grad(self, h: torch.Tensor) -> torch.Tensor:
+        """
+        h: [B, C, H] or [B, 1, H]
+        Returns leaf_id: [B, C] (int64) in [0, 2^k - 1]
+        Computed under no_grad: no backprop through hashing/projection.
+        """
+        with torch.no_grad():
+            # [B,C,k]
+            proj = h @ self.W_proj
+            bits = (proj > 0).to(torch.long)
+            # leaf_id = sum(bits[j] * 2^j), leaf_powers: [k]
+            # ✅ extra safety: ensure powers on same device
+            powers = self.leaf_powers.to(bits.device).view(1, 1, -1)
+            leaf_id = (bits * powers).sum(dim=-1).to(torch.long)
+        return leaf_id
+
+    def condition_with_leaf(self, h: torch.Tensor):
+        """
+        h: [B, C, H] (column hidden states)
+        Returns:
+          h_prime: [B, C, H]
+          leaf_id: [B, C] or None
+        """
+        if (not self.use_leaf_hash) or (self.leaf_bits <= 0):
+            return h, None
+        leaf_id = self._compute_leaf_id_no_grad(h)
+        leaf_bias = self.leaf_emb(leaf_id)  # [B,C,H]
+        h_prime = h + leaf_bias
+        return h_prime, leaf_id
 
     def forward(
         self,
@@ -204,15 +267,21 @@ class TypeAwareGPT2(GPT2PreTrainedModel):
         # 4) gather + experts
         col_hidden, valid_mask = self._gather_column_hidden_states(hidden_states, col_positions)
 
-        num_bin_logits, num_residual = self.num_expert(col_hidden)
-        cat_logits = self.cat_expert(col_hidden)
-        mixed_mask_logits, mixed_bin_logits, mixed_residual = self.mixed_expert(col_hidden)
+        # 1.5 manifold conditioning: h -> h'
+        col_hidden_prime, leaf_id = self.condition_with_leaf(col_hidden)
+
+        # Experts consume h'
+        num_bin_logits, num_residual = self.num_expert(col_hidden_prime)
+        cat_logits = self.cat_expert(col_hidden_prime)
+        mixed_mask_logits, mixed_bin_logits, mixed_residual = self.mixed_expert(col_hidden_prime)
 
         return {
             "hidden_states": hidden_states,
             "col_positions": col_positions,
             "valid_mask": valid_mask,
             "lm_logits": lm_logits,
+            "leaf_id": leaf_id,                 # for debug/analysis (optional)
+            "col_hidden": col_hidden,           # keep h for ablation/debug (optional)
             "expert_outputs": {
                 "cat_logits": cat_logits,
                 "num_bin_logits": num_bin_logits,

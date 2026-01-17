@@ -370,6 +370,13 @@ def parse_args():
                        help="Log every N steps")
     parser.add_argument("--target_col", type=str, default=None, 
                        help="The target column name to move to the first position (Target-First Strategy).")
+    # ===== Leaf hash (Manifold Conditioning) =====
+    parser.add_argument("--leaf_bits", type=int, default=6,
+                       help="Number of hash bits k (num_leaf=2^k). Recommend 6 initially.")
+    parser.add_argument("--leaf_seed", type=int, default=0,
+                       help="Random seed for frozen projection matrix W_proj.")
+    parser.add_argument("--disable_leaf_hash", action="store_true",
+                       help="Disable leaf hash conditioning (ablation).")
     return parser.parse_args()
 
 def load_stage1_checkpoint(model, checkpoint_path, logger):
@@ -557,7 +564,11 @@ def main():
     # Load config and initialize model
     config_name = args.config_name if args.config_name else args.model_name_or_path
     config = AutoConfig.from_pretrained(config_name, cache_dir=args.cache_dir)
-    
+
+    # Inject leaf-hash hyperparams into config (so model.__init__ can read them)
+    setattr(config, "leaf_bits", int(args.leaf_bits))
+    setattr(config, "leaf_seed", int(args.leaf_seed))
+    setattr(config, "use_leaf_hash", bool(not args.disable_leaf_hash))
     # Initialize TypeAwareGPT2 model
     model = TypeAwareGPT2(
         config=config,
@@ -603,7 +614,9 @@ def main():
         task_type=TaskType.CAUSAL_LM,  # Use CAUSAL_LM for GPT2-based models
         bias="none",
         target_modules=["c_attn", "c_fc", "c_proj"],  # GPT2 modules
-        modules_to_save=["num_expert", "mixed_expert", "cat_expert"],
+        # IMPORTANT: leaf_emb is trainable but NOT a LoRA param.
+        # Must be included here to be saved/loaded with the adapter.
+        modules_to_save=["num_expert", "mixed_expert", "cat_expert", "leaf_emb"],
         # target_modules=["q_proj", "v_proj"]
     )
     model = get_peft_model(model, lora_config)
@@ -619,7 +632,20 @@ def main():
     
     # STEP 4: Define optimizer (only trainable parameters)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
+    # optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
+    leaf_params = []
+    base_params = []
+
+    for name, param in model.named_parameters():
+        if "leaf_emb" in name:
+            leaf_params.append(param)
+        else:
+            base_params.append(param)
+
+    optimizer = torch.optim.AdamW([
+        {"params": base_params, "lr": args.lr},
+        {"params": leaf_params, "lr": args.lr * 10}  # 🔥 暴力拉大 50 倍
+    ])
     logger.info(f"Optimizer initialized with {len(trainable_params)} parameter groups")
     
     # STEP 5: Setup data loader
@@ -757,6 +783,23 @@ def main():
                     save_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                     mkdir(save_dir)
                     _save_model(model, save_dir, logger=logger)
+                # 在训练 loop 里
+                if global_step % 100 == 0:
+                    # 1. 尝试拿到原始模型 (剥洋葱)
+                    if hasattr(model, "_module"):
+                        # Opacus 的 GradSampleModule 包装
+                        raw_model = model._module
+                    elif hasattr(model, "module"):
+                        # DDP 的 DistributedDataParallel 包装
+                        raw_model = model.module
+                    else:
+                        raw_model = model
+                    
+                    # 2. 现在可以安全访问 leaf_emb 了
+                    # 只有当 raw_model 真的有这个属性时才打印，防止此时刚好在 save 阶段报错
+                    if hasattr(raw_model, "leaf_emb"):
+                        leaf_norm = raw_model.leaf_emb.weight.data.norm().item()
+                        logger.info(f"🌿 Leaf Emb Norm: {leaf_norm:.4f}")
 
         finally:
             if ctx is not None:
