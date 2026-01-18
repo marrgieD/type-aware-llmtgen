@@ -1,24 +1,10 @@
 #!/bin/bash
 
 # ================= 配置区域 =================
-TRAIN_PATH="./data/adult/train.csv"
-TEST_PATH="./data/adult/train.csv"
+TRAIN_PATH="./adult/train.csv"
+TEST_PATH="./adult/train.csv" 
 
-# 您的文件名
-FAKE_PATHS=(
-    # "./synthetic_data_episilon1.csv"
-    # "./synthetic_data_episilon2.csv"
-    # "./synthetic_data_episilon05.csv"
-    # "./synthetic_data_episilon2_new.csv"
-    # "./synthetic_data_episilon2_newt07.csv"
-    # "./synthetic_data_episilon2_nnew.csv"
-    # "./synthetic_data_episilon1_nnew.csv"
-    # "./synthetic_data_episilon0_restage1.csv"
-    "./data/synthetic/adult_stage2_impute-False/raw_tables/dp_synth256_nodp.csv"
-    "./data/synthetic/adult_stage2_impute-True/raw_tables/dp_synth256.csv"
-)
-
-# 创建结果文件夹
+# 输出目录
 OUTPUT_DIR="./eval_results"
 mkdir -p "$OUTPUT_DIR"
 
@@ -27,20 +13,47 @@ TARGET_NAME="income"
 BINS="50"
 SCORERS="auc accuracy" 
 MODELS="xgb logistic"
-# ===========================================
+
+# ================= 文件列表获取逻辑 =================
+
+# 检查是否有命令行参数输入
+if [ "$#" -gt 0 ]; then
+    # 如果有参数，将所有参数存入数组
+    FAKE_PATHS=("$@")
+    echo ">>> 检测到输入参数，将评估以下 ${#FAKE_PATHS[@]} 个文件："
+else
+    # 如果没有参数，使用默认的硬编码列表
+    echo ">>> 未检测到输入参数，使用默认列表："
+    FAKE_PATHS=(
+        "./data/synthetic/adult_stage2_impute-False/raw_tables/dp_synth256_nodp.csv"
+        "./data/synthetic/adult_stage2_impute-True/raw_tables/dp_synth256.csv"
+    )
+fi
+
+# 打印一下要跑的文件名，方便确认
+printf ' - %s\n' "${FAKE_PATHS[@]}"
+echo "========================================================"
+
+# ================= 循环评估逻辑 =================
 
 for fake_path in "${FAKE_PATHS[@]}"
 do 
-    # 提取文件名
+    # 0. 检查文件是否存在
+    if [ ! -f "$fake_path" ]; then
+        echo "错误：找不到文件 $fake_path ，跳过..."
+        continue
+    fi
+
+    # 提取文件名用于生成报告名
     filename=$(basename -- "$fake_path")
     filename="${filename%.*}"
     RESULT_PATH="${OUTPUT_DIR}/report_${filename}.csv"
 
-    echo "========================================================"
+    echo ""
+    echo "########################################################"
     echo "正在评估: $fake_path"
     echo "结果保存至: $RESULT_PATH"
-    echo "========================================================"
-
+    echo "########################################################"
     # --- 1. 精确重复 (Exact Duplicates) [覆盖模式] ---
     echo "[1/5] Running Exact Duplicates..."
     python metrics/run.py \
