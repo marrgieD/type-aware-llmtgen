@@ -2,7 +2,7 @@
 
 # ================= 配置区域 =================
 TRAIN_PATH="./adult/train.csv"
-TEST_PATH="./adult/train.csv" 
+TEST_PATH="./adult/test.csv" 
 
 # 输出目录
 OUTPUT_DIR="./eval_results"
