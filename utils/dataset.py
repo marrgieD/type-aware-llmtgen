@@ -312,15 +312,20 @@ class LLMtgDataset(Dataset):
                     nv = (v - n_min) / (n_max - n_min + 1e-9)
                     nv = np.clip(nv, 0.0, 1.0)
 
-                    edges = np.array(meta_stats["bin_edges"])
-                    b_id = np.searchsorted(edges, nv, side="right") - 1
-                    b_id = max(0, min(b_id, len(edges) - 2))
+                    # edges = np.array(meta_stats["bin_edges"])
+                    # b_id = np.searchsorted(edges, nv, side="right") - 1
+                    # b_id = max(0, min(b_id, len(edges) - 2))
 
-                    lower, upper = edges[b_id], edges[b_id + 1]
-                    width = max(upper - lower, 1e-9)
-                    res = (nv - lower) / width
-                    res = np.clip(res, 0.0, 1.0)
-                    return b_id, res
+                    # lower, upper = edges[b_id], edges[b_id + 1]
+                    # width = max(upper - lower, 1e-9)
+                    # res = (nv - lower) / width
+                    # res = np.clip(res, 0.0, 1.0)
+                    # return b_id, res
+                    
+                    # [Modified] Regression Expert: No Binning
+                    # Return -100 for bin_id (ignored by loss)
+                    # Return normalized value (nv) directly as residual
+                    return -100, nv
 
                 if ctype == "numerical":
                     expert_labels["col_type_ids"].append(0)

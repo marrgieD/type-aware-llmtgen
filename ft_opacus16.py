@@ -139,25 +139,31 @@ def compute_loss(model_outputs, batch, expert_loss_weight=1.0, lm_loss_weight=0.
             num_bin_labels = batch["num_bin"]
             num_res_labels = batch["num_res"]
 
-            # 1. Bin Loss
-            mask_bin = is_num & (num_bin_labels != -100)
-            if mask_bin.any():
-                # 🛡️ 改进：动态获取 K，不依赖参数 num_bins
-                K = num_bin_logits.size(-1)
-                # 🛡️ 改进：reshape 替代 view
-                raw_bin = ce_none(num_bin_logits.reshape(-1, K), num_bin_labels.reshape(-1))
-                mask_bin_flat = mask_bin.reshape(-1).float()
+            # # 1. Bin Loss
+            # mask_bin = is_num & (num_bin_labels != -100)
+            # if mask_bin.any():
+            #     # 🛡️ 改进：动态获取 K，不依赖参数 num_bins
+            #     K = num_bin_logits.size(-1)
+            #     # 🛡️ 改进：reshape 替代 view
+            #     raw_bin = ce_none(num_bin_logits.reshape(-1, K), num_bin_labels.reshape(-1))
+            #     mask_bin_flat = mask_bin.reshape(-1).float()
                 
-                total_expert_loss_sum += (raw_bin * mask_bin_flat).sum()
-                total_denom += mask_bin_flat.sum()
+            #     total_expert_loss_sum += (raw_bin * mask_bin_flat).sum()
+            #     total_denom += mask_bin_flat.sum()
 
-            # 2. Residual Loss
+            # # 2. Residual Loss
+            # [Modified] Regression Only Loss
+            # We ignore Bin Loss entirely.
+            # num_residual now contains predicted value (0-1)
+            # num_res_labels now contains true value (0-1)
+            
+            # Residual (Value) Loss - MSE
             mask_res = is_num & (num_res_labels != -100)
             if mask_res.any():
                 raw_res = mse_none(num_residual.reshape(-1), num_res_labels.reshape(-1).float())
                 mask_res_flat = mask_res.reshape(-1).float()
                 
-                total_expert_loss_sum += (raw_res * mask_res_flat).sum()
+                total_expert_loss_sum += (raw_res * mask_res_flat*20).sum()
                 total_denom += mask_res_flat.sum()
 
     # -----------------------------------------------------------
@@ -212,17 +218,19 @@ def compute_loss(model_outputs, batch, expert_loss_weight=1.0, lm_loss_weight=0.
             # 假设 dataset 里 1.0 是 active, 0.0 是 missing/NaN
             active = is_mixed & (mixed_mask_labels > 0.5)
             
-            # Mixed Bin
-            mask_active_bin = active & (mixed_bin_labels != -100)
-            if mask_active_bin.any():
-                K_mix = mixed_bin_logits.size(-1)
-                raw_mix_bin = ce_none(mixed_bin_logits.reshape(-1, K_mix), mixed_bin_labels.reshape(-1))
-                mask_ab_flat = mask_active_bin.reshape(-1).float()
+            # # Mixed Bin
+            # mask_active_bin = active & (mixed_bin_labels != -100)
+            # if mask_active_bin.any():
+            #     K_mix = mixed_bin_logits.size(-1)
+            #     raw_mix_bin = ce_none(mixed_bin_logits.reshape(-1, K_mix), mixed_bin_labels.reshape(-1))
+            #     mask_ab_flat = mask_active_bin.reshape(-1).float()
                 
-                total_expert_loss_sum += (raw_mix_bin * mask_ab_flat).sum()
-                total_denom += mask_ab_flat.sum()
+            #     total_expert_loss_sum += (raw_mix_bin * mask_ab_flat).sum()
+            #     total_denom += mask_ab_flat.sum()
             
             # Mixed Residual
+            # [Modified] Mixed Value Loss (MSE Only)
+            # Ignore mixed_bin_logits
             mask_active_res = active 
             if mask_active_res.any():
                 raw_mix_res = mse_none(mixed_residual.reshape(-1), mixed_res_labels.reshape(-1).float())

@@ -3,11 +3,14 @@ import torch.nn as nn
 from transformers import GPT2PreTrainedModel, GPT2Model
 
 class NumericExpert(nn.Module):
-    """Column-level numeric expert."""
+    """Column-level numeric expert (Regression Version)."""
     def __init__(self, hidden_size: int, num_bins: int = 100):
         super().__init__()
-        self.bin_head = nn.Linear(hidden_size, num_bins)
-        self.residual_head = nn.Sequential(
+        # self.bin_head = nn.Linear(hidden_size, num_bins)
+        # self.residual_head = nn.Sequential(
+        # [Modified] Regression Expert: Predict value directly
+        # Removed bin_head, renamed residual_head to value_head for clarity
+        self.value_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, 1),
@@ -15,9 +18,14 @@ class NumericExpert(nn.Module):
         )
 
     def forward(self, col_hidden_states: torch.Tensor):
-        bin_logits = self.bin_head(col_hidden_states)               # [B,C,K]
-        residual = self.residual_head(col_hidden_states).squeeze(-1)  # [B,C]
-        return bin_logits, residual
+        # bin_logits = self.bin_head(col_hidden_states)               # [B,C,K]
+        # residual = self.residual_head(col_hidden_states).squeeze(-1)  # [B,C]
+        # return bin_logits, residual
+        # [Modified] No bin_logits for regression
+        bin_logits = None 
+        # Predict normalized value directly
+        pred_value = self.value_head(col_hidden_states).squeeze(-1)  # [B,C]
+        return bin_logits, pred_value
 
 
 class CategoricalExpert(nn.Module):
