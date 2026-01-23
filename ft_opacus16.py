@@ -236,7 +236,7 @@ def compute_loss(model_outputs, batch, expert_loss_weight=1.0, lm_loss_weight=0.
                 raw_mix_res = mse_none(mixed_residual.reshape(-1), mixed_res_labels.reshape(-1).float())
                 mask_ar_flat = mask_active_res.reshape(-1).float()
                 
-                total_expert_loss_sum += (raw_mix_res * mask_ar_flat).sum()
+                total_expert_loss_sum += (raw_mix_res * mask_ar_flat *20).sum()
                 total_denom += mask_ar_flat.sum()
 
     # 3. Final Aggregation
@@ -253,11 +253,14 @@ def compute_loss(model_outputs, batch, expert_loss_weight=1.0, lm_loss_weight=0.
     
     # 遍历所有 expert 的输出 logits，全都乘 0 加进去
     # 这样无论 batch 里有没有 mixed/num/cat 数据，计算图永远是通的
-    for key in ["num_bin_logits", "num_residual", 
+    for key in ["num_residual", 
                 "cat_logits", 
-                "mixed_mask_logits", "mixed_bin_logits", "mixed_residual"]:
+                "mixed_mask_logits", "mixed_residual"]:
         if key in expert_outputs:
-            dummy_loss += expert_outputs[key].sum() * 0.0
+            # 加上 is not None 双重保险（虽然从列表删了就不需要了，但为了稳健可以留着）
+            val = expert_outputs[key]
+            if val is not None:
+                dummy_loss += val.sum() * 0.0
     total_loss = (lm_loss_weight * lm_loss) + (expert_loss_weight * expert_loss)+ dummy_loss
     
     return total_loss, lm_loss_item, expert_loss_item

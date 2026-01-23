@@ -144,81 +144,59 @@ def load_stage2_lora(model, lora_path, logger):
     return model
 
 
+# ==============================================================================
+# 请将 generate6.py 中的 sample_from_expert 和 generate_column_batch 替换为以下代码
+# ==============================================================================
+
 def sample_from_expert(expert_outputs, col_name, col_type, col_meta, device, temperature=1.0):
     INT_COLUMNS = ["age", "fnlwgt", "education-num", "capital-gain", "capital-loss", "hours-per-week"]
     col_lower = col_name.lower()
 
+    # ---------------- [修改] Numerical (回归逻辑) ----------------
     if col_type == "numerical":
-        bin_logits = expert_outputs["num_bin_logits"]
-        residual = expert_outputs["num_residual"]
-        bin_probs = F.softmax(bin_logits / temperature, dim=-1)
-        bin_id = torch.multinomial(bin_probs, 1).squeeze(-1)
-        res = residual.squeeze(-1)
+        # 直接获取预测值 (Batch,)
+        pred_norm = expert_outputs["num_residual"]
+        vals_np = pred_norm.cpu().numpy()
         
         stats = col_meta["stats"]
-        bin_edges = np.array(stats["bin_edges"])
-        bin_id_np = bin_id.cpu().numpy()
-        res_np = res.cpu().numpy()
+        norm_min, norm_max = stats["norm_min"], stats["norm_max"]
         
         values = []
-        for i in range(len(bin_id_np)):
-            bid = int(bin_id_np[i])
-            bid = max(0, min(bid, len(bin_edges) - 2))
-            lower, upper = bin_edges[bid], bin_edges[bid + 1]
-            width = max(upper - lower, 1e-9)
-            nv = lower + res_np[i] * width
+        for i in range(len(vals_np)):
+            nv = vals_np[i]
+            # 截断到 [0, 1] 之间，防止越界
             nv = np.clip(nv, 0.0, 1.0)
             
-            norm_min, norm_max = stats["norm_min"], stats["norm_max"]
+            # 反归一化
             v = nv * (norm_max - norm_min) + norm_min
+            
+            # 反 Log
             if stats.get("needs_log", False):
                 shift = stats.get("log_shift", 1e-6)
                 v = np.exp(v) - shift
             
+            # 整数取整
             if col_lower in INT_COLUMNS:
                 v = int(round(v))
-                
+            
             values.append(str(v))
         return values
-    
-    # elif col_type == "categorical":
-    #     cat_logits = expert_outputs["cat_logits"]
-    #     cat_probs = F.softmax(cat_logits / temperature, dim=-1)
-    #     cat_id = torch.multinomial(cat_probs, 1).squeeze(-1)
-        
-    #     categories = col_meta["categories"]
-    #     vocab = categories["unique"]
-    #     unk_id = categories.get("unk_id", 0) 
-        
-    #     cat_id_np = cat_id.cpu().numpy()
-    #     values = []
-    #     for i in range(len(cat_id_np)):
-    #         cid = int(cat_id_np[i])
-    #         if 0 <= cid < len(vocab):
-    #             values.append(str(vocab[cid]))
-    #         else:
-    #             values.append(str(vocab[unk_id]))
-    #     return values
+
+    # ---------------- Categorical (逻辑不变，但在 generate_column_batch 里处理了 logits) ----------------
     elif col_type == "categorical":
         cat_logits = expert_outputs["cat_logits"]
         
-        # 获取当前列的类别信息
+        # 屏蔽非法维度
         categories = col_meta["categories"]
         vocab = categories["unique"]
-        vocab_len = len(vocab) # 比如 Income=2
-
-        # ================= 🔥🔥🔥 Logit Masking 修复 🔥🔥🔥 =================
-        # 强制屏蔽非法类别索引。如果模型输出维度 (43) 大于当前列实际类别数 (2)，
-        # 将 index >= 2 的位置设为 -inf，防止采样到非法值导致 [UNK]/NaN
+        vocab_len = len(vocab)
         if vocab_len < cat_logits.size(-1):
             cat_logits[:, vocab_len:] = -float('inf')
-        # ====================================================================
 
         cat_probs = F.softmax(cat_logits / temperature, dim=-1)
         cat_id = torch.multinomial(cat_probs, 1).squeeze(-1)
         
         unk_id = categories.get("unk_id", 0) 
-        
         cat_id_np = cat_id.cpu().numpy()
         values = []
         for i in range(len(cat_id_np)):
@@ -228,158 +206,99 @@ def sample_from_expert(expert_outputs, col_name, col_type, col_meta, device, tem
             else:
                 values.append(str(vocab[unk_id]))
         return values
+
+    # ---------------- [修改] Mixed (混合类型逻辑 - 重点修复 Capital-Gain) ----------------
     elif col_type == "mixed":
         mask_logits = expert_outputs["mixed_mask_logits"]
-        bin_logits = expert_outputs["mixed_bin_logits"]
-        residual = expert_outputs["mixed_residual"]
+        pred_norm = expert_outputs["mixed_residual"] # 直接是数值
         
+        # 1. 采样 Mask (分类: 0 or Not-0)
         mask_probs = torch.sigmoid(mask_logits / temperature)
         mask = torch.bernoulli(mask_probs)
         mask_np = mask.cpu().numpy()
         
-        bin_probs = F.softmax(bin_logits / temperature, dim=-1)
-        bin_ids = torch.multinomial(bin_probs, 1).squeeze(-1)
-        bin_ids_np = bin_ids.cpu().numpy()
-        residual_np = residual.cpu().numpy()
+        vals_np = pred_norm.cpu().numpy()
         
         stats = col_meta["stats"]
-        bin_edges = np.array(stats["bin_edges"])
         norm_min, norm_max = stats["norm_min"], stats["norm_max"]
-        needs_log = stats.get("needs_log", False)
-        log_shift = stats.get("log_shift", 1e-6) if needs_log else 0.0
         
         values = []
         for i in range(len(mask_np)):
+            # Dataset里定义: 0.0 是 zero-like (即 0 或 NaN), 1.0 是 active
+            # 预测出来如果 mask < 0.5，说明模型认为是 0
             if mask_np[i] < 0.5:
                 values.append("0")
             else:
-                bid = int(bin_ids_np[i])
-                bid = max(0, min(bid, len(bin_edges) - 2))
-                lower, upper = bin_edges[bid], bin_edges[bid + 1]
-                width = max(upper - lower, 1e-9)
-                nv = lower + residual_np[i] * width
+                # 2. 数值部分反归一化 (Regression)
+                nv = vals_np[i]
                 nv = np.clip(nv, 0.0, 1.0)
+                
                 v = nv * (norm_max - norm_min) + norm_min
-                if needs_log:
-                    v = np.exp(v) - log_shift
+                if stats.get("needs_log", False):
+                    shift = stats.get("log_shift", 1e-6)
+                    v = np.exp(v) - shift
                 
                 if col_lower in INT_COLUMNS:
                     v = int(round(v))
                     
                 values.append(str(v))
         return values
-
-# def generate_column_batch(model, tokenizer, prompts, col_name, col_type, col_meta, metadata, device, temperature=1.0, key_val_sep="is"):
-#     type_token_map = {"numerical": "[NUM]", "categorical": "[CAT]", "mixed": "[MIX]"}
-#     type_token = type_token_map.get(col_type, "[NUM]")
-#     prefix = f"{type_token} {col_name} {key_val_sep}"
     
-#     # 构造 Prompt
-#     full_prompts = [(p + " " + prefix) if p and not p.endswith(" ") else (p + prefix) for p in prompts]
-    
-#     encoded = tokenizer(full_prompts, return_tensors="pt", padding=True, truncation=True, max_length=512)
-#     input_ids = encoded["input_ids"].to(device)
-#     attention_mask = encoded["attention_mask"].to(device)
-    
-#     # ================= 🚀 核心修复：把 no_grad 范围扩大到最后！ =================
-#     with torch.no_grad():
-#         # 1. Backbone 计算
-#         transformer_outputs = model.transformer(
-#             input_ids=input_ids, 
-#             attention_mask=attention_mask
-#         )
-#         last_hidden_states = transformer_outputs[0]
-
-#         # 2. 提取 Hidden State (保留高级索引优化)
-#         batch_size = last_hidden_states.size(0)
-#         last_token_indices = attention_mask.sum(dim=1) - 1
-#         col_hidden_states = last_hidden_states[torch.arange(batch_size, device=device), last_token_indices]
-#         col_hidden_states = col_hidden_states.unsqueeze(1) # [Batch, 1, Hidden]
-
-#         # 3. Expert 计算 (必须在 no_grad 里面！)
-#         # 上次就是这里漏在外面了，导致 output 带上了梯度
-#         expert_outputs = {}
-        
-#         if col_type == "numerical":
-#             bin_logits, residual = model.num_expert(col_hidden_states)
-#             expert_outputs = {"num_bin_logits": bin_logits.squeeze(1), "num_residual": residual.squeeze(1)}
-#         elif col_type == "categorical":
-#             cat_logits = model.cat_expert(col_hidden_states)
-#             expert_outputs = {"cat_logits": cat_logits.squeeze(1)}
-#         elif col_type == "mixed":
-#             mask_logits, bin_logits, residual = model.mixed_expert(col_hidden_states)
-#             expert_outputs = {"mixed_mask_logits": mask_logits.squeeze(1), "mixed_bin_logits": bin_logits.squeeze(1), "mixed_residual": residual.squeeze(1)}
-    
-#     # 离开 no_grad 块时，expert_outputs 里的 tensor 已经是 clean 的（无梯度），可以放心转 numpy
-#     return sample_from_expert(expert_outputs, col_name, col_type, col_meta, device, temperature)
+    return []
 
 
 def generate_column_batch(
     model, tokenizer, prompts, col_name, col_type, col_meta, metadata, 
     device, temperature=1.0, key_val_sep="is",
-    max_context_tokens=512 # 加上这个防止显存爆炸
+    max_context_tokens=512 
 ):
     model.eval()
     
-    # 1. 准备前缀: [CAT] col_name is
     type_token_map = {"numerical": "[NUM]", "categorical": "[CAT]", "mixed": "[MIX]"}
     type_token = type_token_map.get(col_type, "[NUM]")
     prefix = f"{type_token} {col_name} {key_val_sep}"
     
-    # 2. 构造 Prompt 并 Tokenize
-    # 这里我们只做单纯的 Expert 推理，所以只需要把 prompt + prefix 喂进去拿到 hidden state 即可
+    # 构造 Prompt
     seqs = []
     for p in prompts:
         p = p or ""
-        # 拼接逻辑：保证 prompt 和 prefix 之间有空格
         full_text = (p + " " + prefix) if (p and not p.endswith(" ")) else (p + prefix)
-        
         ids = tokenizer.encode(full_text, add_special_tokens=False)
-        # 简单的左侧截断，防止超长
         if len(ids) > max_context_tokens:
             ids = ids[-max_context_tokens:]
         seqs.append(torch.tensor(ids, dtype=torch.long))
     
-    # Padding
     input_ids = pad_sequence(seqs, batch_first=True, padding_value=tokenizer.pad_token_id).to(device)
     attention_mask = (input_ids != tokenizer.pad_token_id).long()
 
-    # 3. 核心计算 (全程 no_grad，速度最快)
     with torch.no_grad():
-        # A. 跑一遍模型拿到 Hidden States
-        # 假设你的 model forward 返回 dict 包含 "hidden_states"
-        # 如果是 HuggingFace 原生模型，通常是 outputs.last_hidden_state
         out = model(
             input_ids=input_ids, 
             attention_mask=attention_mask,
             output_expert_logits=False 
         )
         
-        # 兼容一下：有的模型实现返回是 tuple，有的是 dict
         if isinstance(out, dict):
             hidden_states = out.get("hidden_states", out.get("last_hidden_state"))
         else:
-            hidden_states = out[0] # tuple
+            hidden_states = out[0]
 
-        # B. 提取最后一个 Token 的向量 (Expert Head 只需要看最后一个 token)
         batch_size = hidden_states.size(0)
-        # 找到每个样本非 padding 的最后一个位置
         last_token_indices = attention_mask.sum(dim=1) - 1
         col_hidden_states = hidden_states[torch.arange(batch_size, device=device), last_token_indices]
-        col_hidden_states = col_hidden_states.unsqueeze(1) # [Batch, 1, Hidden]
+        col_hidden_states = col_hidden_states.unsqueeze(1) 
 
-        # C. 丢给对应的 Expert Head
         expert_outputs = {}
         
+        # ================= [关键修复] 不要对 None 调用 squeeze() =================
         if col_type == "numerical":
             bin_logits, residual = model.num_expert(col_hidden_states)
             expert_outputs = {
-                "num_bin_logits": bin_logits.squeeze(1),
-                "num_residual": residual.squeeze(1)
+                "num_bin_logits": None,      # 以前是 bin_logits.squeeze(1) -> 报错
+                "num_residual": residual.squeeze(1) # [Batch]
             }
             
         elif col_type == "categorical":
-            # 直接算 logits，不管它原本是不是想用 LM，现在强制走分类头
             cat_logits = model.cat_expert(col_hidden_states)
             expert_outputs = {
                 "cat_logits": cat_logits.squeeze(1)
@@ -389,12 +308,10 @@ def generate_column_batch(
             mask_logits, bin_logits, residual = model.mixed_expert(col_hidden_states)
             expert_outputs = {
                 "mixed_mask_logits": mask_logits.squeeze(1),
-                "mixed_bin_logits": bin_logits.squeeze(1),
-                "mixed_residual": residual.squeeze(1)
+                "mixed_bin_logits": None,     # [修复] 这里必须是 None，别 squeeze
+                "mixed_residual": residual.squeeze(1) # [Batch]
             }
 
-    # 4. 采样并返回
-    # 离开 no_grad 块，数据已经是 clean 的 tensor
     return sample_from_expert(expert_outputs, col_name, col_type, col_meta, device, temperature)
 
 def generate_synthetic_data(model, tokenizer, dataset, metadata, num_samples, device, temperature=0.7, batch_size=32, logger=None, show_progress=True):
